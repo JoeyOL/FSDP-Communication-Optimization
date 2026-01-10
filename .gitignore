@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 训练/运行产物
+training_log*
+fsdp_output/
+
+# 数据与模型权重（体积巨大，建议不要进 Git；如确需版本化，请单独开 repo 或精简）
+datasets/
+models/
+
+# 其他杂项
+trash/
