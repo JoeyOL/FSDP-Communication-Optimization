@@ -14,12 +14,38 @@ DATA_PATH="/root/llama-7b/datasets/wikipedia_en_300mb.json"
 OUTPUT_DIR="/root/llama-7b/fsdp_output"
 LOG_FILE="$OUTPUT_DIR/training_log_safe_${TIMESTAMP}.txt"
 
+# 训练超参（确保与 fsdp_train.py 透传一致）
+MASTER_PORT=29501
+BATCH_SIZE=16
+GRAD_ACC_STEPS=4
+LEARNING_RATE=6e-5
+NUM_EPOCHS=2
+WARMUP_STEPS=0
+WEIGHT_DECAY=0.01
+MAX_LENGTH=512
+SAVE_STEPS=100
+LOG_INTERVAL=5
+DATALOADER_NUM_WORKERS=2
+SEED=42
+
 echo "📊 训练配置:"
 echo "   • GPU数量: $GPU_COUNT"
 echo "   • 模型路径: $MODEL_PATH"
 echo "   • 数据路径: $DATA_PATH"
 echo "   • 输出目录: $OUTPUT_DIR"
 echo "   • 时间戳: $TIMESTAMP"
+echo "   • master_port: $MASTER_PORT"
+echo "   • batch_size: $BATCH_SIZE"
+echo "   • grad_accum_steps: $GRAD_ACC_STEPS"
+echo "   • learning_rate: $LEARNING_RATE"
+echo "   • num_epochs: $NUM_EPOCHS"
+echo "   • warmup_steps: $WARMUP_STEPS"
+echo "   • weight_decay: $WEIGHT_DECAY"
+echo "   • max_length: $MAX_LENGTH"
+echo "   • save_steps: $SAVE_STEPS"
+echo "   • log_interval: $LOG_INTERVAL"
+echo "   • dataloader_num_workers: $DATALOADER_NUM_WORKERS"
+echo "   • seed: $SEED"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 # 检查GPU
@@ -72,21 +98,22 @@ echo "📝 日志文件: $LOG_FILE"
 # 启动训练并记录日志
 torchrun \
     --nproc_per_node=$GPU_COUNT \
-    --master_port=29501 \
+    --master_port=$MASTER_PORT \
     fsdp_train.py \
     --model_path "$MODEL_PATH" \
     --data_path "$DATA_PATH" \
     --output_dir "$OUTPUT_DIR" \
-    --batch_size 16 \
-    --gradient_accumulation_steps 4 \
-    --learning_rate 6e-5 \
-    --num_epochs 2 \
-    --warmup_steps 0 \
-    --weight_decay 0.01 \
-    --max_length 512 \
-    --save_steps 100 \
-    --log_interval 5 \
-    --dataloader_num_workers 2 \
+    --batch_size $BATCH_SIZE \
+    --gradient_accumulation_steps $GRAD_ACC_STEPS \
+    --learning_rate $LEARNING_RATE \
+    --num_epochs $NUM_EPOCHS \
+    --warmup_steps $WARMUP_STEPS \
+    --weight_decay $WEIGHT_DECAY \
+    --max_length $MAX_LENGTH \
+    --save_steps $SAVE_STEPS \
+    --log_interval $LOG_INTERVAL \
+    --dataloader_num_workers $DATALOADER_NUM_WORKERS \
+    --seed $SEED \
     --run_name "llama7b-safe-${TIMESTAMP}" 2>&1 | tee "$LOG_FILE"
 
 training_exit_code=${PIPESTATUS[0]}
