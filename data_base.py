@@ -49,6 +49,32 @@ class WikipediaDataset(Dataset):
                 and int(meta.get("shard_size", -1)) == int(shard_size)
             )
 
+        def _compat_mismatch_detail(meta: dict) -> str:
+            pairs = [
+                (
+                    "data_path",
+                    str(data_path),
+                    str(meta.get("data_path")),
+                ),
+                (
+                    "max_length",
+                    str(int(self.max_length)),
+                    str(meta.get("max_length")),
+                ),
+                (
+                    "shard_size",
+                    str(int(shard_size)),
+                    str(meta.get("shard_size")),
+                ),
+            ]
+            diffs = []
+            for k, cur, old in pairs:
+                if cur != old:
+                    diffs.append(f"- {k}: current={cur} | meta={old}")
+            if not diffs:
+                return "(fields look equal, but meta was still considered incompatible)"
+            return "\n".join(diffs)
+
         def _load_shards_from_meta(meta: dict) -> list:
             shards = meta.get("shards", [])
             all_enc = []
@@ -69,7 +95,10 @@ class WikipediaDataset(Dataset):
                     logger.warning("检测到未完成的预分词 meta，将尝试断点续作...")
             if not _is_compatible_meta(meta):
                 raise ValueError(
-                    f"缓存 meta 与当前参数不一致：{cache_meta_path}（建议删除旧缓存后重跑）"
+                    "缓存 meta 与当前参数不一致："
+                    f"{cache_meta_path}\n"
+                    f"差异如下：\n{_compat_mismatch_detail(meta)}\n"
+                    "建议：删除旧缓存后重跑，或保持训练参数与缓存一致。"
                 )
             if not meta.get("finalized", True):
                 # rank0 会走续作分支；其他 rank 等待 rank0 完成后再加载

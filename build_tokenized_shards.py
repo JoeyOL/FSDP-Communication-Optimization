@@ -51,6 +51,21 @@ def _is_compatible_meta(meta: dict, data_path: str, max_length: int, shard_size:
     )
 
 
+def _compat_mismatch_detail(meta: dict, data_path: str, max_length: int, shard_size: int) -> str:
+    pairs = [
+        ("data_path", str(data_path), str(meta.get("data_path"))),
+        ("max_length", str(int(max_length)), str(meta.get("max_length"))),
+        ("shard_size", str(int(shard_size)), str(meta.get("shard_size"))),
+    ]
+    diffs = []
+    for k, cur, old in pairs:
+        if cur != old:
+            diffs.append(f"- {k}: current={cur} | meta={old}")
+    if not diffs:
+        return "(fields look equal, but meta was still considered incompatible)"
+    return "\n".join(diffs)
+
+
 def build_shards(
     *,
     data_path: str,
@@ -84,8 +99,10 @@ def build_shards(
         meta = torch.load(cache_meta_path)
         if not _is_compatible_meta(meta, data_path, max_length, shard_size):
             raise ValueError(
-                f"Existing meta is incompatible with current args: {cache_meta_path}. "
-                f"(delete it or run with --force_restart)"
+                "Existing meta is incompatible with current args:\n"
+                f"{cache_meta_path}\n"
+                f"Diffs:\n{_compat_mismatch_detail(meta, data_path, max_length, shard_size)}\n"
+                "Fix: delete old cache or run with --force_restart."
             )
         if not meta.get("finalized", True):
             shard_paths = list(meta.get("shards", []))

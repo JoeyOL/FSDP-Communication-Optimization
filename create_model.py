@@ -13,13 +13,23 @@ def load_tokenizer():
     return tokenizer
 
 def load_model(tokenizer):
+    # Important: after `add_special_tokens`, `len(tokenizer)` may be larger than
+    # `tokenizer.vocab_size`. Using `tokenizer.vocab_size` can lead to token ids
+    # (e.g., pad_token_id) exceeding the embedding size and crash with
+    # CUDA indexSelect assertions.
+    vocab_size = len(tokenizer)
     config = GPT2Config(
-        vocab_size=tokenizer.vocab_size,
+        vocab_size=vocab_size,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
         torch_dtype='float32'  # 明确指定数据类型为 float32
     )
     model = GPT2LMHeadModel(config)
+
+    # Ensure embedding table matches tokenizer size.
+    if model.config.vocab_size != vocab_size:
+        model.resize_token_embeddings(vocab_size)
+
     print(f"模型参数的数据类型是: {next(model.parameters()).dtype}")
     return model
 
