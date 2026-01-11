@@ -48,14 +48,15 @@ def train_epoch_with_monitoring(model, dataloader, optimizer, scheduler, epoch, 
 
     optimizer.zero_grad()
     
-    # 使用 disable 参数，更简洁地控制进度条只在 rank 0 上显示
-    progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=(rank != 0))
+    # 使用 disable 参数，确保只有 rank0 打印进度条
+    progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=(rank != 0), dynamic_ncols=True)
     
     for batch_idx, batch in enumerate(progress_bar):
         global_step = epoch * num_batches + batch_idx
         try:
             # 将数据移动到GPU
-            batch = {k: v.to(f'cuda:{rank}', non_blocking=True) for k, v in batch.items()}
+            # 默认约定：cuda 设备已在外部通过 torch.cuda.set_device(local_rank) 设置
+            batch = {k: v.cuda(non_blocking=True) for k, v in batch.items()}
             
             with record_function("forward_pass"): # Profiler 记录
                 outputs = model(**batch)
@@ -107,7 +108,7 @@ def train_epoch_with_monitoring(model, dataloader, optimizer, scheduler, epoch, 
             'loss': f'{loss.item() * args.gradient_accumulation_steps:.4f}',
             'avg_loss': f'{total_loss/(batch_idx+1):.4f}',
             'lr': f'{scheduler.get_last_lr()[0]:.2e}',
-            'gpu_mem': f'{torch.cuda.memory_allocated(rank)/1024**3:.1f}GB'
+            'gpu_mem': f'{torch.cuda.memory_allocated()/1024**3:.1f}GB'
             })
 
     # --- 训练结束后清理 ---

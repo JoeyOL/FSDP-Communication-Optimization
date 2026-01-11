@@ -275,8 +275,6 @@ def main():
     # 防止 rank0 保存时间较长导致其他 rank 提前退出，引发后续通信/销毁阶段异常
     if dist.is_initialized():
         dist.barrier()
-        
-        logger.info(f"最终模型已保存到: {final_dir}")
     
     dist.barrier()
     

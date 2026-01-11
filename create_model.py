@@ -1,8 +1,11 @@
 from transformers import (
     GPT2Config, GPT2LMHeadModel, GPT2Tokenizer
 )
+from transformers import LlamaTokenizer, LlamaForCausalLM
+import torch
 
-SAVE_PATH = "./sanguo"
+SAVE_PATH = "./models/gpt2"
+LLAMA_PATH = "./models/llama-7b"
 def load_tokenizer():
     tokenizer = GPT2Tokenizer.from_pretrained(SAVE_PATH)
     tokenizer.add_special_tokens({"eos_token": "</s>", "bos_token": "<s>",
@@ -34,7 +37,7 @@ def load_model(tokenizer):
 #     # 从本地加载 LLaMA-7B 模型，使用更激进的内存优化
 #     model = LlamaForCausalLM.from_pretrained(
 #         LLAMA_PATH,
-#         torch_dtype=torch.float16,  # 使用 bfloat16 替代 float16 更稳定
+#         torch_dtype=torch.bfloat16,  # 使用 bfloat16 替代 float16 更稳定
 #         low_cpu_mem_usage=True,      # 降低 CPU 内存使用
 #         use_cache=False         # 关闭缓存，节省内存
 #     )
