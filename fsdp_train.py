@@ -12,6 +12,8 @@ from pathlib import Path
 import argparse
 import functools
 import torch.distributed as dist
+import random
+import numpy as np
 from transformers import (
     DataCollatorForLanguageModeling
 )
@@ -24,6 +26,15 @@ from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_state_dict,
 )
+
+
+def set_seed(seed: int) -> None:
+    """尽量保证可复现（注意：多 GPU/FSDP 仍可能存在非确定性算子）。"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 class GradQuantState:
@@ -136,11 +147,15 @@ def main():
     parser.add_argument('--eval_steps', type=int, default=None, help='评估间隔步数')
     parser.add_argument('--dataloader_num_workers', type=int, default=2, help='数据加载器worker数量')
     parser.add_argument('--run_name', type=str, default='llama7b-fsdp-wiki', help='运行名称')
+    parser.add_argument('--seed', type=int, default=42, help='随机种子')
     
     args = parser.parse_args()
     
     # 设置分布式训练
     rank, world_size, local_rank = setup_distributed()
+
+    # 可复现性（在初始化进程组后调用，保证各 rank 都设置）
+    set_seed(args.seed + rank)
     
     logger.info(f"🎯 Rank {rank} 开始加载模型...")
     logger.info(f"模型路径: {args.model_path}")
@@ -155,7 +170,7 @@ def main():
     logger.info("创建FSDP包装...")
     # 优化的 FSDP 配置
     model = FSDP(model,
-        device_id=rank,
+        device_id=local_rank,
         auto_wrap_policy = functools.partial(
             transformer_auto_wrap_policy,
             transformer_layer_cls={
@@ -186,10 +201,10 @@ def main():
     )
     dataloader = DataLoader(
         dataset,
-        batch_size=16, # 使用 argparse 中的 batch_size
+        batch_size=args.batch_size,
         sampler=sampler,
         collate_fn=data_collator,
-        num_workers=1, # 使用 argparse 中的 num_workers
+        num_workers=args.dataloader_num_workers,
         pin_memory=True
     )
 
@@ -201,7 +216,7 @@ def main():
     total_steps = (len(dataloader) // args.gradient_accumulation_steps) * args.num_epochs
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=0, # 例如 100 步
+        num_warmup_steps=args.warmup_steps,
         num_training_steps=total_steps
     )
     logger.info(f"总训练步数: {total_steps}, 预热步数: {args.warmup_steps}")
@@ -222,7 +237,15 @@ def main():
             logger.info(f"Epoch {epoch + 1}/{args.num_epochs}, 平均损失: {avg_loss:.4f}")
     
     logger.info(f"Rank {rank} 正在参与收集状态字典...")
-    options = StateDictOptions(full_state_dict=True, rank0_only=True)
+    # torch==2.5.1 的 StateDictOptions 不支持 rank0_only。
+    # 用 broadcast_from_rank0：先由 rank0 收集完整 state_dict，再广播到其他 rank，
+    # 同时启用 cpu_offload 将 state_dict 放到 CPU，降低 GPU 峰值显存。
+    # 注意：get_state_dict 内部包含集体通信，必须所有 rank 都执行到这里。
+    options = StateDictOptions(
+        full_state_dict=True,
+        cpu_offload=True,
+        broadcast_from_rank0=True,
+    )
     full_state_dict = get_state_dict(model, optimizer, options=options)
     
     if rank == 0:
@@ -232,20 +255,34 @@ def main():
         final_dir = Path(args.output_dir) / "final_model"
         final_dir.mkdir(parents=True, exist_ok=True)
         
-        # 从收集到的字典中提取模型状态
-        model_state_dict = full_state_dict["model"]
+        # 从返回值中提取模型状态（不同 torch 版本返回结构可能不同）
+        # - 可能是 dict: {"model": ..., "optimizer": ...}
+        # - 也可能是 tuple: (model_state_dict, optim_state_dict)
+        if isinstance(full_state_dict, dict):
+            model_state_dict = full_state_dict["model"]
+        elif isinstance(full_state_dict, tuple) and len(full_state_dict) >= 1:
+            model_state_dict = full_state_dict[0]
+        else:
+            raise TypeError(
+                f"get_state_dict 返回了不支持的类型: {type(full_state_dict)}"
+            )
         logger.info("状态字典在 Rank 0 上收集完成。")
         
         # 保存模型权重
         torch.save(model_state_dict, final_dir / "pytorch_model.bin")
         tokenizer.save_pretrained(final_dir)
+
+    # 防止 rank0 保存时间较长导致其他 rank 提前退出，引发后续通信/销毁阶段异常
+    if dist.is_initialized():
+        dist.barrier()
         
         logger.info(f"最终模型已保存到: {final_dir}")
     
     dist.barrier()
     
     # 清理分布式训练
-    if world_size > 1:
+    # 清理分布式训练
+    if dist.is_initialized():
         dist.destroy_process_group()
 
 if __name__ == "__main__":
