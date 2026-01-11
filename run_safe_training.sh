@@ -10,7 +10,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 GPU_COUNT=2
 MODEL_PATH="/root/llama-7b/models"
-DATA_PATH="/root/llama-7b/datasets/wikipedia_en_300mb.json"
+DATA_PATH="/root/llama-7b/datasets/wikipedia_en_500mb.json"
 OUTPUT_DIR="/root/llama-7b/fsdp_output"
 LOG_FILE="$OUTPUT_DIR/training_log_safe_${TIMESTAMP}.txt"
 

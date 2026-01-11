@@ -48,8 +48,8 @@ def main() -> None:
     parser.add_argument(
         "--model_dir",
         type=str,
-        required=True,
         help="训练输出的 final_model 目录；需要包含 pytorch_model.bin 和 tokenizer 文件",
+        default="./fsdp_output/final_model",
     )
     parser.add_argument("--max_new_tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=0.8)
@@ -94,7 +94,7 @@ def main() -> None:
         if user_text in {"/exit", "/quit"}:
             break
 
-        prompt = build_prompt(user_text)
+        prompt = user_text
         reply = generate_reply(
             model,
             tokenizer,

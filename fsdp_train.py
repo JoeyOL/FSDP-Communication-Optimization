@@ -148,6 +148,8 @@ def main():
     parser.add_argument('--dataloader_num_workers', type=int, default=2, help='数据加载器worker数量')
     parser.add_argument('--run_name', type=str, default='llama7b-fsdp-wiki', help='运行名称')
     parser.add_argument('--seed', type=int, default=42, help='随机种子')
+    parser.add_argument('--dataset_shard_size', type=int, default=5000, help='预分词缓存分片大小（条数），用于大 JSON 文件')
+    parser.add_argument('--dataset_max_samples', type=int, default=0, help='最多加载/预分词多少条样本（0表示全量），用于快速自检')
     
     args = parser.parse_args()
     
@@ -192,7 +194,13 @@ def main():
     
     # 加载数据集
     logger.info("加载数据集...")
-    dataset = WikipediaDataset(args.data_path, tokenizer, args.max_length)
+    dataset = WikipediaDataset(
+        args.data_path,
+        tokenizer,
+        args.max_length,
+        shard_size=args.dataset_shard_size,
+        max_samples=args.dataset_max_samples,
+    )
     
     # 创建数据加载器 - 减少内存使用
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank) if world_size > 1 else None
