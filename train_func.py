@@ -1,11 +1,17 @@
 import torch
 from logger import logger
 from tqdm import tqdm
-from pathlib import Path
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
-from torch.profiler import profile, record_function, ProfilerActivity
-from torch.utils.tensorboard import SummaryWriter
+from torch.profiler import record_function
 import torch.distributed as dist
+
+from perf.comm_profiler import (
+    finalize_monitoring,
+    init_monitoring,
+    should_stop_early,
+    step_begin,
+    step_end,
+)
 
 
 # --- 新增带监控的训练函数 ---
@@ -15,34 +21,12 @@ def train_epoch_with_monitoring(model, dataloader, optimizer, scheduler, epoch, 
     scaler = ShardedGradScaler()
     total_loss = 0.0
     num_batches = len(dataloader)
-    
-    # --- TensorBoard 和 Profiler 设置 (仅在rank 0上执行) ---
-    tb_writer = None
-    prof = None
-    if rank == 0:
-        # 定义日志目录
-        log_dir = Path(args.output_dir) / "logs" / args.run_name
-        tb_log_dir = log_dir / "tensorboard"
-        profiler_log_dir = log_dir / "profiler"
-        tb_log_dir.mkdir(parents=True, exist_ok=True)
-        profiler_log_dir.mkdir(parents=True, exist_ok=True)
-        
-        # 初始化 TensorBoard Writer
-        tb_writer = SummaryWriter(log_dir=str(tb_log_dir))
-        
-        # 配置 Profiler
-        prof = profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(str(profiler_log_dir)),
-            record_shapes=True,
-            profile_memory=True,
-            with_stack=True,
-            with_flops=True,
-            with_modules=True
-        )
-        prof.start()
-        logger.info(f"📊 TensorBoard 日志已启动，目录: {tb_log_dir}")
-        logger.info(f"⏱️ Profiler 已启动，追踪文件将保存至: {profiler_log_dir}")
+
+    # --- TensorBoard 和 Profiler 设置 (仅在 rank 0 上执行；实现细节在 perf/ 下) ---
+    monitor = init_monitoring(args, rank)
+    if rank == 0 and monitor.enabled:
+        logger.info(f"📊 TensorBoard 日志已启动，目录: {monitor.tb_log_dir}")
+        logger.info(f"⏱️ Profiler 已启动，追踪文件将保存至: {monitor.profiler_log_dir}")
     
     dist.barrier()  # 确保所有进程都完成初始化
 
@@ -53,6 +37,7 @@ def train_epoch_with_monitoring(model, dataloader, optimizer, scheduler, epoch, 
     
     for batch_idx, batch in enumerate(progress_bar):
         global_step = epoch * num_batches + batch_idx
+        step_t0 = step_begin(monitor, args)
         try:
             # 将数据移动到GPU
             # 默认约定：cuda 设备已在外部通过 torch.cuda.set_device(local_rank) 设置
@@ -84,15 +69,15 @@ def train_epoch_with_monitoring(model, dataloader, optimizer, scheduler, epoch, 
                     scheduler.step()
 
             # --- TensorBoard 日志记录 (仅在rank 0) ---
-            if rank == 0 and tb_writer:
+            if rank == 0 and monitor.tb_writer:
                 current_loss = loss.item() * args.gradient_accumulation_steps
-                tb_writer.add_scalar('Loss/step', current_loss, global_step)
-                tb_writer.add_scalar('LearningRate/step', scheduler.get_last_lr()[0], global_step)
+                monitor.tb_writer.add_scalar('Loss/step', current_loss, global_step)
+                monitor.tb_writer.add_scalar('LearningRate/step', scheduler.get_last_lr()[0], global_step)
                 if batch_idx % 20 == 0: # 每20步记录一次内存
                     mem_alloc = torch.cuda.memory_allocated(rank) / 1024**3
                     mem_res = torch.cuda.memory_reserved(rank) / 1024**3
-                    tb_writer.add_scalar('Memory/Allocated_GB', mem_alloc, global_step)
-                    tb_writer.add_scalar('Memory/Reserved_GB', mem_res, global_step)
+                    monitor.tb_writer.add_scalar('Memory/Allocated_GB', mem_alloc, global_step)
+                    monitor.tb_writer.add_scalar('Memory/Reserved_GB', mem_res, global_step)
 
         except torch.cuda.OutOfMemoryError:
             logger.error(f"步骤 {batch_idx} 发生 CUDA OOM！")
@@ -102,6 +87,15 @@ def train_epoch_with_monitoring(model, dataloader, optimizer, scheduler, epoch, 
         except Exception as e:
             logger.error(f"训练步骤 {batch_idx} 发生未知错误: {e}")
             continue
+
+        # 让 profiler schedule 前进 + （可选）采集 step wall time
+        step_end(monitor, args, step_t0)
+
+        # --- 可选：短跑，用于耗时取证 ---
+        if should_stop_early(args, global_step):
+            if rank == 0:
+                logger.info(f"达到 max_steps={getattr(args, 'max_steps', 0)}，提前结束本轮训练。")
+            break
             
         if rank == 0:
             progress_bar.set_postfix({
@@ -113,13 +107,9 @@ def train_epoch_with_monitoring(model, dataloader, optimizer, scheduler, epoch, 
 
     # --- 训练结束后清理 ---
     if rank == 0:
-        if prof:
-            prof.stop()
-            logger.info("⏱️ Profiler 已停止。")
-        if tb_writer:
-            avg_epoch_loss = total_loss / num_batches
-            tb_writer.add_scalar('Loss/epoch', avg_epoch_loss, epoch)
-            tb_writer.close()
+        finalize_monitoring(monitor, args=args, epoch=epoch, total_loss=total_loss, num_batches=num_batches)
+        if monitor.enabled:
+            logger.info("⏱️ Profiler 已停止，并已写出摘要文件。")
             logger.info("📊 TensorBoard writer 已关闭。")
     
     dist.barrier()  # 确保所有进程都完成

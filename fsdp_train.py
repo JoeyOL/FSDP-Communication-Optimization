@@ -150,6 +150,26 @@ def main():
     parser.add_argument('--seed', type=int, default=42, help='随机种子')
     parser.add_argument('--dataset_shard_size', type=int, default=2000, help='预分词缓存分片大小（条数），用于大 JSON 文件')
     parser.add_argument('--dataset_max_samples', type=int, default=0, help='最多加载/预分词多少条样本（0表示全量），用于快速自检')
+
+    # --- Step1/取证：耗时 profiling 与短跑 ---
+    parser.add_argument(
+        '--profile',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='是否启用 torch.profiler（默认启用；可用 --no-profile 关闭）',
+    )
+    parser.add_argument(
+        '--profile_step_time',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help='是否额外统计每 step 的 wall time（默认关闭）',
+    )
+    parser.add_argument(
+        '--max_steps',
+        type=int,
+        default=0,
+        help='最多训练多少个 step（跨 epoch 计数；0 表示不限制）',
+    )
     
     args = parser.parse_args()
     
