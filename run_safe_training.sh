@@ -46,6 +46,9 @@ echo "   • save_steps: $SAVE_STEPS"
 echo "   • log_interval: $LOG_INTERVAL"
 echo "   • dataloader_num_workers: $DATALOADER_NUM_WORKERS"
 echo "   • seed: $SEED"
+if [ "$#" -gt 0 ]; then
+    echo "   • extra_args: $*"
+fi
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 # 检查GPU
@@ -114,7 +117,8 @@ torchrun \
     --log_interval $LOG_INTERVAL \
     --dataloader_num_workers $DATALOADER_NUM_WORKERS \
     --seed $SEED \
-    --run_name "llama7b-safe-${TIMESTAMP}" 2>&1 | tee "$LOG_FILE"
+    --run_name "llama7b-safe-${TIMESTAMP}" \
+    "$@" 2>&1 | tee "$LOG_FILE"
 
 training_exit_code=${PIPESTATUS[0]}
 
