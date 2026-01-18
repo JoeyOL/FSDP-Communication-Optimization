@@ -38,6 +38,30 @@
   - baseline：不注册 comm hook；
   - 压缩：注册对应 hook，并且保证训练可跑通（至少小数据集/少步数）。
 
+当前仓库实现口径（模块化已落地）：
+
+- 压缩器统一放在 `comm_compress/`，通过注册表按名称创建可注册到 FSDP 的 comm hook。
+- 训练入口参数：
+  - `--comm_compress <method>`：选择压缩方法（默认 `none`）。
+  - `--comm_config_json '{...}'`：方法配置（JSON object 字符串）。
+
+示例：
+
+```bash
+# baseline（不压缩）
+torchrun --standalone --nproc_per_node=2 fsdp_train.py \
+  --data_path /root/llama-7b/datasets/wikipedia_en_10mb.json \
+  --output_dir /root/llama-7b/fsdp_output \
+  --comm_compress none
+
+# int8：对称 int8 量化 + int8 reduce-scatter
+torchrun --standalone --nproc_per_node=2 fsdp_train.py \
+  --data_path /root/llama-7b/datasets/wikipedia_en_10mb.json \
+  --output_dir /root/llama-7b/fsdp_output \
+  --comm_compress int8 \
+  --comm_config_json '{"num_bits": 8}'
+```
+
 中期范围要求：覆盖开题报告中提到的压缩方法（按报告口径归类），至少包括：
 
 - 稀疏化：Top-k、Random-k、threshold-v、Sketched-SGD（sketch 映射）、GradiVeQ（矩阵分解/低秩/向量量化类）。
