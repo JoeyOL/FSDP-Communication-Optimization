@@ -8,6 +8,102 @@
 
 当前仓库的训练对象并非真正的 LLaMA-7B 微调，而是使用 **GPT-2 架构（~62M 参数）随机初始化**进行预训练式语言建模（Wikipedia 文本续写），用于通信优化实验对比（迭代更快、易复现）。
 
+## 1.1 中期必须完成（里程碑）
+
+下面三步是中期答辩“必须可交付、可复现、可量化对比”的目标（按顺序推进）：
+
+### 步骤 1：用代码证明 FSDP 反向阶段通信是主要瓶颈且可优化
+
+验收要求（需要“证据文件/日志/trace”，不是口头结论）：
+
+- 通过 `torch.profiler`（必要）或 Nsight Systems（可选）采集一次训练迭代的 trace，明确标出：
+  - 反向阶段中与 FSDP 相关的通信算子（典型如 `reduce_scatter` / `all_gather`）耗时占比。
+  - 在不同 `world_size`（至少 1 卡 vs 2 卡）下，通信占比上升且成为 step time 的主要组成。
+- 需要在代码中把采集过程固化下来：
+  - 例如在训练入口增加 `--profile` / `--profile_steps` 等参数；
+  - 输出 profiler 结果到 `output_dir/logs/<run_name>/profiler/` 并可用 TensorBoard 打开。
+
+输出产物（中期材料可直接引用）：
+
+- profiler trace（TensorBoard 可视化）+ 一份摘要表（每步通信耗时/占比、compute 耗时/占比）。
+
+### 步骤 2：实现“通信压缩热插拔模块”（支持多种压缩算法）
+
+目标：把压缩算法从训练脚本中解耦出来，形成可配置/可扩展的模块，并能以“开关 + 配置”方式在 FSDP 通信路径上启用。
+
+验收要求：
+
+- 训练脚本支持命令行选择压缩算法，例如：`--comm_compress {none,int8,fp16,qsgd,nc,topk,randomk,thresholdv,sketch,gradiveq,signsgd,onebit,...}`（名称可再统一）。
+- 压缩模块能在不改训练主逻辑的情况下替换/组合（热插拔）：
+  - baseline：不注册 comm hook；
+  - 压缩：注册对应 hook，并且保证训练可跑通（至少小数据集/少步数）。
+
+中期范围要求：覆盖开题报告中提到的压缩方法（按报告口径归类），至少包括：
+
+- 稀疏化：Top-k、Random-k、threshold-v、Sketched-SGD（sketch 映射）、GradiVeQ（矩阵分解/低秩/向量量化类）。
+- 量化：FP16、8-bit（INT8/FP8 之一先做基线）、1-bit SGD、SignSGD、QSGD、NC（Natural Compression）。
+- 误差反馈（Error Feedback）：对量化/稀疏化提供可选残差补偿开关。
+- 混合压缩：至少支持“稀疏化 + 量化”的组合配置（哪种先做、是否对索引/值分别编码）。
+
+说明：部分算法在工业实现中会有多种变体（是否无偏、是否需要额外 all-reduce/广播 scale、是否需要稀疏索引通信格式等）。中期要求是“实现可运行版本 + 说明实现口径”，并保证对比实验的公平性（同一训练设置）。
+
+### 步骤 3：设计并落地一套可复现的指标体系，对比各压缩模块
+
+目标：让每个压缩方法的效果可以被同一套指标与同一份结果文件直接对比与画图。
+
+建议的最小指标集合（中期必须落盘）：
+
+- 通信压缩（“压了多少”）：
+  - 原始通信字节数 vs 压缩后通信字节数（必须包含索引/元数据/scale 等开销），以及压缩比。
+  - 稀疏化密度：非零占比（density）/稀疏率（sparsity），以及索引编码开销占比（index_bytes / bytes_compressed）。
+- 通信时间（“省了多少通信时间”）：
+  - 每 step 通信耗时（总）与占比。
+  - 按算子拆分：`reduce_scatter` / `all_gather` / `all_reduce` 等（至少覆盖反向相关通信）。
+- 训练效率（“端到端快了多少”）：
+  - step time（均值/中位数 + P90/P95），tokens/s。
+  - GPU 显存峰值（allocated / reserved）。
+- 训练质量（“精度/收敛有没有受影响”）：
+  - 训练 loss 曲线（同等 step 数）+ 验证集 loss/PPL（同等 checkpoint）。
+
+建议的扩展指标（更能体现压缩算法“优越性”，中期强烈推荐至少选 4–6 项落盘）：
+
+- 端到端收益口径（避免只看压缩比“自嗨”）：
+  - `time_to_quality`：达到某个目标 PPL/val loss 阈值所需时间（或所需 steps）。
+  - `quality_at_time`：固定训练时间预算下的 PPL/val loss（更贴近工程）。
+- 重叠与可扩展性（通信优化的核心）：
+  - 通信-计算重叠率：通信算子与计算算子重叠的时间比例（profiler 可估）。
+  - 有效通信带宽：`effective_bw = bytes_raw / comm_time`（以及压缩后 `bytes_compressed / comm_time`），用于量化“链路利用率”。
+  - scaling efficiency：从 1 卡到 2 卡（再到更多卡）时 tokens/s 增长比例与 step time 变化。
+- 算法/实现开销（很多压缩方法会把收益吃掉）：
+  - 压缩/解压耗时：`compress_time_ms`、`decompress_time_ms`（最好按 GPU kernel/CPU 逻辑区分）。
+  - 额外同步开销：为压缩引入的额外 collective 次数（例如额外 `all_reduce(MAX)` 同步 scale），以及其耗时。
+  - 额外显存/内存开销：残差（Error Feedback）缓冲、索引缓冲、临时张量峰值。
+- 收敛稳定性/数值误差（用于解释“为什么某方法掉点/发散”）：
+  - 梯度误差统计（诊断用，可抽样计算）：
+    - 相对误差 $\|g-\hat g\|/\|g\|$（L2 或 L∞），以及 cosine 相似度 $\cos(g,\hat g)$。
+  - 残差（EF）范数：`residual_norm` 随 step 的变化（判断 EF 是否在“吃掉误差”）。
+  - 无效 loss/数值异常计数：NaN/Inf step 次数、梯度裁剪触发频率等。
+- 鲁棒性与公平对比（让结果更可信）：
+  - 多 seed 重复：报告均值±标准差（至少 3 个 seed）。
+  - 丢弃 warmup：统计 step time/吞吐时跳过前 N step（避开编译/缓存抖动）。
+
+输出产物：每次 run 产出一条结构化记录（建议 `results.jsonl` 或 `results.csv`），字段建议分“必填 + 可选扩展”。
+
+- 必填（中期最小闭环）：
+  - `run_name, world_size, model, dataset, max_length, batch_size, compress_method, compress_config, seed`
+  - `step_time_ms_mean, step_time_ms_p50, step_time_ms_p90, tokens_per_s`
+  - `comm_time_ms_total, comm_ratio, comm_time_ms_by_op`（by_op 可用 JSON 字符串）
+  - `bytes_raw_total, bytes_compressed_total, compression_ratio`
+  - `train_loss, val_loss, val_ppl`
+- 可选扩展（体现优越性/解释原因）：
+  - `compress_time_ms, decompress_time_ms, extra_collectives, extra_collective_time_ms`
+  - `index_bytes, density, residual_norm`
+  - `grad_rel_error, grad_cos_sim`
+  - `mem_peak_alloc_gb, mem_peak_reserved_gb`
+  - `time_to_target_ppl_s, ppl_at_fixed_time`
+
+中期对比建议：优先做 `world_size=2` 的 baseline vs 各压缩方法，固定训练步数与数据，先跑通再扩展规模。
+
 ## 2. 运行环境与约定
 
 - OS：Linux
