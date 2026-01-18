@@ -149,7 +149,7 @@ torchrun --standalone --nproc_per_node=2 fsdp_train.py \
 
 - `fsdp_train.py`
   - 训练入口：分布式初始化、FSDP 包装、DataLoader、优化器、训练循环、保存。
-  - **通信压缩 hook 的实现也在这里**：`fsdp_quantized_comm_hook`（int8 量化 reduce-scatter）。
+  - **通信压缩 hook 通过模块化包接入**：见 `comm_compress/`（训练入口参数 `--comm_compress/--comm_config_json`）。
   - 目前 hook 注册段落在代码中是注释状态（需要打开/参数化，做 baseline vs int8 对比）。
 
 - `train_func.py`
@@ -216,6 +216,16 @@ cd /root/llama-7b
 ./run_safe_training.sh
 ```
 
+说明：该脚本是“真正的项目启动命令”，默认会启动 TensorBoard 并用 `torchrun` 跑双卡。脚本也支持把额外参数透传给 `fsdp_train.py`，用于做压缩方法/取证参数的对比实验，例如：
+
+```bash
+# baseline
+./run_safe_training.sh --comm_compress none
+
+# int8 压缩
+./run_safe_training.sh --comm_compress int8 --comm_config_json '{"num_bits": 8}'
+```
+
 脚本会：
 - 打印 GPU 信息
 - 后台启动 TensorBoard（端口 6006）
@@ -259,10 +269,12 @@ python chat_model.py \
 
 ### 8.1 已实现：INT8 量化 reduce-scatter hook（原型）
 
-位置：`fsdp_train.py` 中
+位置：`comm_compress/int8.py`（模块化实现）
 
-- `GradQuantState`
-- `fsdp_quantized_comm_hook(state, full_flat_grad, shard_out)`
+启用方式（训练入口参数）：
+
+- `--comm_compress int8`
+- `--comm_config_json '{"num_bits": 8}'`
 
 关键逻辑：
 - 全局 max（`all_reduce(MAX)`) 对齐 scale
@@ -272,12 +284,14 @@ python chat_model.py \
 
 > 注意：当前 `model.register_comm_hook(...)` 在 `fsdp_train.py` 里被注释，默认仍是 baseline。
 
+> 注意：当前实现通过 `comm_compress/registry.py` 按方法名创建 hook，并在 `fsdp_train.py` 中按参数注册；baseline 为 `--comm_compress none`（默认）。
+
 ### 8.2 中期答辩建议的算法对比矩阵（双卡）
 
 建议把实验先聚焦到 world_size=2：
 
 1) Baseline：无压缩（不注册 hook）
-2) Quant-INT8：启用 `fsdp_quantized_comm_hook`
+2) Quant-INT8：启用 `--comm_compress int8`
 3) Sparsify（计划）：Random-k / Top-k（需要设计稀疏格式通信或先做原型）
 4) Error Feedback（计划/加分）：对量化/稀疏化增加残差补偿，提高精度保持性
 
