@@ -27,6 +27,104 @@
 
 - profiler trace（TensorBoard 可视化）+ 一份摘要表（每步通信耗时/占比、compute 耗时/占比）。
 
+Linux 环境下推荐用仓库脚本一键跑出证据文件（默认短跑 20 steps，确保 profiler schedule 生效）：
+
+```bash
+chmod +x scripts/step1_profile.sh
+
+# 单卡：验证链路与产物
+./scripts/step1_profile.sh \
+  --data_path /root/llama-7b/datasets/wikipedia_en_1k.json \
+  --output_dir /root/llama-7b/fsdp_output \
+  --nproc 1
+
+# 双卡：做 1 vs 2 的通信占比/重叠率对比
+./scripts/step1_profile.sh \
+  --data_path /root/llama-7b/datasets/wikipedia_en_10mb.json \
+  --output_dir /root/llama-7b/fsdp_output \
+  --nproc 2 \
+  --max_steps 50
+```
+
+产物默认写到：
+
+- `output_dir/logs/<run_name>/profiler/summary_rank0.json`（包含通信占比与通信覆盖比/重叠率）
+- `output_dir/logs/<run_name>/profiler/comm_op_summary_rank0.csv`
+- `output_dir/logs/<run_name>/profiler/*.pt.trace.json`（TensorBoard Profiler 可视化与 overlap 计算输入）
+
+实现说明（本仓库已固化 Step1 取证代码）：
+
+- 训练侧只保留最小接入：`train_epoch_with_monitoring(...)` 调用监控模块（rank0 生效）。
+- 耗时/取证逻辑已从训练代码中解耦到 `perf/`：
+  - `perf/comm_profiler.py`：统一负责启动/推进/结束 profiler，并写出 `summary_rank0.json` 与 `comm_op_summary_rank0.csv`。
+  - `perf/trace_overlap.py`：从 profiler 的 Chrome trace（`*.pt.trace.json`）估算通信-计算重叠（通信覆盖比）。
+- 启动脚本：`scripts/step1_profile.sh`（Linux），默认开启：
+  - `--profile/--no-profile`：是否启用 profiler（默认启用）
+  - `--profile-step-time`：额外统计每 step wall time（默认关闭，脚本中开启）
+  - `--max_steps`：短跑步数（用于取证；建议 >= 20）
+
+#### 步骤 1：采集指标说明（字段含义与数据来源）
+
+本仓库 Step1 的“证据文件”主要包含两类：
+
+- `summary_rank0.json`：汇总指标（用于写结论/对比 1 卡 vs 2 卡）
+- `comm_op_summary_rank0.csv`：通信相关算子列表（用于截图/定位热点）
+
+`summary_rank0.json` 关键字段：
+
+- `step_time.*`（来源：`time.perf_counter()`，需开启 `--profile-step-time`）
+  - `mean_ms/p50_ms/p90_ms/p95_ms`：端到端每 step wall time 分布（包含计算+通信+同步+CPU 开销等）。
+  - 作用：作为“真实训练迭代耗时”口径，对比扩展性与抖动。
+- `profiler.total_cuda_time_ms / total_cpu_time_ms`（来源：`torch.profiler.profile().key_averages()` 聚合事件总和）
+  - 作用：提供被 profiler 观测到的总体事件量级（注意：不是严格意义上的 step wall time）。
+- `profiler.comm_cuda_time_ms / comm_cpu_time_ms`（来源：同上，按事件名关键词过滤）
+  - 通信事件关键词：`reduce_scatter/all_gather/all_reduce/broadcast/nccl/c10d`（近似口径）。
+- `profiler.comm_ratio_cuda / comm_ratio_cpu`
+  - 定义：通信事件累计时间 / 全部事件累计时间。
+  - 解读：2 卡相对 1 卡显著上升时，可作为“通信占比上升、成为瓶颈”的证据之一。
+- `overlap.overall.*`（来源：解析 `*.pt.trace.json` 的 GPU kernel 时间区间并计算交并集）
+  - `comm_total_ms`：通信相关 GPU kernel 的区间并集总时长（近似）。
+  - `compute_total_ms`：非通信 GPU kernel 的区间并集总时长（近似，排除 memcpy/memset）。
+  - `overlap_ms`：通信区间与计算区间的交集时长。
+  - `comm_covered_ratio`（通信覆盖比/重叠率）：$\mathrm{overlap\_ms} / \mathrm{comm\_total\_ms}$。
+    - 越高：通信越多被计算隐藏（重叠更充分）。
+    - 越低：通信越“裸露”，更容易拉长 step。
+  - `comm_exposed_ratio = 1 - comm_covered_ratio`：通信暴露比。
+
+`comm_op_summary_rank0.csv` 字段：
+
+- `name/count/cpu_time_total_ms/cuda_time_total_ms`（来源：`prof.key_averages()` 聚合）
+  - 作用：列出通信相关热点事件（用于定位 reduce-scatter / all-gather 等是否出现，以及其耗时排序）。
+
+注意事项（避免误解）：
+
+- `comm_ratio_*` 与 `overlap.*` 都是“关键词分类”的近似口径，适合做趋势对比（1 卡 vs 2 卡）与中期证据展示，不等价于严格的算子级因果归因。
+- profiler 采用 schedule（默认 wait/warmup/active），因此 trace 只覆盖部分 steps；建议取证时 `--max_steps >= 20`，并用相同设置对比 1 卡与 2 卡。
+
+#### 步骤 1：如何验证（复现流程与预期现象）
+
+1) 单卡先验证“链路与产物”
+
+- 运行：`./scripts/step1_profile.sh --data_path ... --output_dir ... --nproc 1`
+- 检查：`output_dir/logs/<run_name>/profiler/` 下存在
+  - `summary_rank0.json`
+  - `comm_op_summary_rank0.csv`
+  - `*.pt.trace.json`
+
+2) 双卡做 1 vs 2 对比验证“通信占比/重叠率趋势”
+
+- 运行：`./scripts/step1_profile.sh --data_path ... --output_dir ... --nproc 2 --max_steps 50`
+- 预期（常见趋势，不同硬件/模型会有差异）：
+  - `profiler.comm_ratio_cuda`：2 卡通常高于 1 卡（通信事件占比上升）。
+  - `overlap.overall.comm_exposed_ratio`：2 卡常见上升（通信更难完全隐藏）。
+  - `step_time.mean_ms`：2 卡若扩展效率不理想，会不降反升或下降幅度小。
+  - `comm_op_summary_rank0.csv` 中能看到 `reduce_scatter/all_gather/all_reduce/nccl` 相关事件出现在 top 列表。
+
+3) 可视化核对（推荐截图做中期材料）
+
+- `tensorboard --logdir output_dir/logs/<run_name>`
+- 打开 “PyTorch Profiler”，对比 1 卡/2 卡 step 时间线中通信相关条块占比与重叠情况。
+
 ### 步骤 2：实现“通信压缩热插拔模块”（支持多种压缩算法）
 
 目标：把压缩算法从训练脚本中解耦出来，形成可配置/可扩展的模块，并能以“开关 + 配置”方式在 FSDP 通信路径上启用。
