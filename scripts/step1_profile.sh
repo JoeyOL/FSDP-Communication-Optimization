@@ -32,7 +32,7 @@ DATA_PATH=""
 OUTPUT_DIR="out"
 RUN_NAME=""
 NPROC=1
-MAX_STEPS=20
+MAX_STEPS=200
 DATASET_MAX_SAMPLES=200
 BATCH_SIZE=2
 MAX_LENGTH=128
@@ -86,8 +86,10 @@ fi
 
 mkdir -p "$OUTPUT_DIR"
 
-BASE_CMD=(
-  python fsdp_train.py
+# NOTE: torchrun expects the training script/module directly (e.g. fsdp_train.py),
+# not a nested "python fsdp_train.py" command.
+BASE_ARGS=(
+  fsdp_train.py
   --data_path "$DATA_PATH"
   --output_dir "$OUTPUT_DIR"
   --run_name "$RUN_NAME"
@@ -97,13 +99,13 @@ BASE_CMD=(
   --dataset_max_samples "$DATASET_MAX_SAMPLES"
   --max_steps "$MAX_STEPS"
   --profile
-  --profile-step-time
+  --profile_step_time
 )
 
 if [[ "$NPROC" -le 1 ]]; then
-  CMD=("${BASE_CMD[@]}" "${PASSTHROUGH[@]}")
+  CMD=(python "${BASE_ARGS[@]}" "${PASSTHROUGH[@]}")
 else
-  CMD=(torchrun --standalone --nproc_per_node="$NPROC" "${BASE_CMD[@]}" "${PASSTHROUGH[@]}")
+  CMD=(torchrun --standalone --nproc_per_node="$NPROC" "${BASE_ARGS[@]}" "${PASSTHROUGH[@]}")
 fi
 
 echo "[RUN] ${CMD[*]}"

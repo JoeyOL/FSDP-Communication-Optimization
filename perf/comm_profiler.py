@@ -67,8 +67,15 @@ def _summarize_profiler_comm_ops(prof: torch.profiler.profile) -> dict[str, Any]
     for evt in prof.key_averages():
         key = (getattr(evt, "key", "") or "").lower()
 
-        # cpu/cuda 时间字段在不同版本上都较稳定（单位 us）
-        cuda_us = float(getattr(evt, "cuda_time_total", 0.0) or 0.0)
+        # 不同 torch 版本字段名不同：
+        # - 旧版: cuda_time_total / self_cuda_time_total
+        # - 新版: device_time_total / self_device_time_total（表格里仍显示 CUDA total）
+        # 这里统一取“总 device/cuda 时间”（单位通常为 us）。
+        cuda_like = getattr(evt, "cuda_time_total", None)
+        if cuda_like is None:
+            cuda_like = getattr(evt, "device_time_total", 0.0)
+        cuda_us = float(cuda_like or 0.0)
+
         cpu_us = float(getattr(evt, "cpu_time_total", 0.0) or 0.0)
 
         total_cuda_us += cuda_us

@@ -34,7 +34,7 @@ chmod +x scripts/step1_profile.sh
 
 # 单卡：验证链路与产物
 ./scripts/step1_profile.sh \
-  --data_path /root/llama-7b/datasets/wikipedia_en_1k.json \
+  --data_path /root/llama-7b/datasets/wikipedia_en_10mb.json \
   --output_dir /root/llama-7b/fsdp_output \
   --nproc 1
 
