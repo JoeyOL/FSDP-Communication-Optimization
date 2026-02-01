@@ -23,7 +23,7 @@ def train_epoch_with_monitoring(model, dataloader, optimizer, scheduler, epoch, 
     num_batches = len(dataloader)
 
     # --- TensorBoard 和 Profiler 设置 (仅在 rank 0 上执行；实现细节在 perf/ 下) ---
-    monitor = init_monitoring(args, rank)
+    monitor = init_monitoring(args, rank, num_batches)
     if rank == 0 and monitor.enabled:
         logger.info(f"📊 TensorBoard 日志已启动，目录: {monitor.tb_log_dir}")
         logger.info(f"⏱️ Profiler 已启动，追踪文件将保存至: {monitor.profiler_log_dir}")
@@ -36,7 +36,8 @@ def train_epoch_with_monitoring(model, dataloader, optimizer, scheduler, epoch, 
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=(rank != 0), dynamic_ncols=True)
     
     for batch_idx, batch in enumerate(progress_bar):
-        global_step = epoch * num_batches + batch_idx
+        # epoch 传入为 1-based，这里换算为 0-based 以保证 max_steps 计数准确
+        global_step = (epoch - 1) * num_batches + batch_idx
         step_t0 = step_begin(monitor, args)
         try:
             # 将数据移动到GPU

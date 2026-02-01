@@ -144,7 +144,7 @@ class MonitoringContext:
     step_times_ms: list[float] = field(default_factory=list)
 
 
-def init_monitoring(args: Any, rank: int) -> MonitoringContext:
+def init_monitoring(args: Any, rank: int, epoch_steps: int) -> MonitoringContext:
     """初始化 TensorBoard + torch.profiler（只在 rank0 启用）。
 
     约定：
@@ -169,7 +169,9 @@ def init_monitoring(args: Any, rank: int) -> MonitoringContext:
 
     tb_writer = SummaryWriter(log_dir=str(tb_log_dir))
 
-    schedule = torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1)
+    # 方案A：记录整个 epoch 内的全部 step
+    active_steps = max(1, min(int(epoch_steps), 20))
+    schedule = torch.profiler.schedule(wait=1, warmup=1, active=active_steps, repeat=1)
     prof = torch.profiler.profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
         schedule=schedule,

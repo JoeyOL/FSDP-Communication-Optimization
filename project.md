@@ -82,14 +82,16 @@ chmod +x scripts/step1_profile.sh
 - `profiler.comm_ratio_cuda / comm_ratio_cpu`
   - 定义：通信事件累计时间 / 全部事件累计时间。
   - 解读：2 卡相对 1 卡显著上升时，可作为“通信占比上升、成为瓶颈”的证据之一。
-- `overlap.overall.*`（来源：解析 `*.pt.trace.json` 的 GPU kernel 时间区间并计算交并集）
+- `overlap.overall.*`（来源：解析 `*.pt.trace.json` 的 GPU kernel 时间区间并计算交并集；两套口径）
   - `comm_total_ms`：通信相关 GPU kernel 的区间并集总时长（近似）。
-  - `compute_total_ms`：非通信 GPU kernel 的区间并集总时长（近似，排除 memcpy/memset）。
-  - `overlap_ms`：通信区间与计算区间的交集时长。
-  - `comm_covered_ratio`（通信覆盖比/重叠率）：$\mathrm{overlap\_ms} / \mathrm{comm\_total\_ms}$。
-    - 越高：通信越多被计算隐藏（重叠更充分）。
-    - 越低：通信越“裸露”，更容易拉长 step。
-  - `comm_exposed_ratio = 1 - comm_covered_ratio`：通信暴露比。
+  - `compute_total_ms_loose`：非通信 GPU kernel 的区间并集总时长（近似，排除 memcpy/memset；loose 口径，偏宽）。
+  - `overlap_ms_loose`：通信区间与 compute(loose) 区间的交集时长。
+  - `comm_covered_ratio_loose`（通信覆盖比/重叠率）：$\mathrm{overlap\_ms\_loose} / \mathrm{comm\_total\_ms}$。
+  - `comm_exposed_ratio_loose = 1 - comm_covered_ratio_loose`：通信暴露比（loose）。
+  - `compute_total_ms_strict`：更严格的 compute 口径（口径A）：仅匹配少量“重计算 kernel”关键词（如 gemm/attention/triton）。
+  - `overlap_ms_strict`：通信区间与 compute(strict) 区间的交集时长。
+  - `comm_covered_ratio_strict`（口径A 通信覆盖比）：$\mathrm{overlap\_ms\_strict} / \mathrm{comm\_total\_ms}$。
+  - `comm_exposed_ratio_strict = 1 - comm_covered_ratio_strict`：通信暴露比（strict）。
 
 `comm_op_summary_rank0.csv` 字段：
 
@@ -116,7 +118,7 @@ chmod +x scripts/step1_profile.sh
 - 运行：`./scripts/step1_profile.sh --data_path ... --output_dir ... --nproc 2 --max_steps 50`
 - 预期（常见趋势，不同硬件/模型会有差异）：
   - `profiler.comm_ratio_cuda`：2 卡通常高于 1 卡（通信事件占比上升）。
-  - `overlap.overall.comm_exposed_ratio`：2 卡常见上升（通信更难完全隐藏）。
+  - `overlap.overall.comm_exposed_ratio_strict`：2 卡常见上升（通信更难完全隐藏）。
   - `step_time.mean_ms`：2 卡若扩展效率不理想，会不降反升或下降幅度小。
   - `comm_op_summary_rank0.csv` 中能看到 `reduce_scatter/all_gather/all_reduce/nccl` 相关事件出现在 top 列表。
 

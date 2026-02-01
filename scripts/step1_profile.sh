@@ -24,18 +24,18 @@ Step1: 一键启动耗时取证（torch.profiler + step wall time + overlap）
 
 示例：
   ./scripts/step1_profile.sh --data_path datasets/wikipedia_en_1k.json --nproc 1
-  ./scripts/step1_profile.sh --data_path datasets/wikipedia_en_10mb.json --nproc 2 --max_steps 50
+  ./scripts/step1_profile.sh --data_path datasets/wikipedia_en_300mb.json --nproc 2 --max_steps 50
 EOF
 }
 
 DATA_PATH=""
-OUTPUT_DIR="out"
+OUTPUT_DIR="/root/llama-7b/fsdp_output"
 RUN_NAME=""
 NPROC=1
-MAX_STEPS=200
-DATASET_MAX_SAMPLES=200
-BATCH_SIZE=2
-MAX_LENGTH=128
+MAX_STEPS=30
+DATASET_MAX_SAMPLES=0
+BATCH_SIZE=8
+MAX_LENGTH=512
 
 PASSTHROUGH=()
 
@@ -98,6 +98,7 @@ BASE_ARGS=(
   --max_length "$MAX_LENGTH"
   --dataset_max_samples "$DATASET_MAX_SAMPLES"
   --max_steps "$MAX_STEPS"
+  --warmup_steps 0
   --profile
   --profile_step_time
 )

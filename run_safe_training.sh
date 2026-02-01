@@ -10,7 +10,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 GPU_COUNT=2
 MODEL_PATH="/root/llama-7b/models"
-DATA_PATH="datasets/wikipedia_en_500mb.json"
+DATA_PATH="datasets/wikipedia_en_300mb.json"
 OUTPUT_DIR="/root/llama-7b/fsdp_output"
 LOG_FILE="$OUTPUT_DIR/training_log_safe_${TIMESTAMP}.txt"
 
@@ -23,10 +23,18 @@ NUM_EPOCHS=2
 WARMUP_STEPS=0
 WEIGHT_DECAY=0.01
 MAX_LENGTH=512
-SAVE_STEPS=100
-LOG_INTERVAL=5
 DATALOADER_NUM_WORKERS=2
 SEED=42
+
+# 是否启用性能分析
+PROFILE=false
+
+# profile flag for BooleanOptionalAction
+if [[ "$PROFILE" == "true" ]]; then
+    PROFILE_FLAG="--profile"
+else
+    PROFILE_FLAG="--no-profile"
+fi
 
 echo "📊 训练配置:"
 echo "   • GPU数量: $GPU_COUNT"
@@ -42,8 +50,6 @@ echo "   • num_epochs: $NUM_EPOCHS"
 echo "   • warmup_steps: $WARMUP_STEPS"
 echo "   • weight_decay: $WEIGHT_DECAY"
 echo "   • max_length: $MAX_LENGTH"
-echo "   • save_steps: $SAVE_STEPS"
-echo "   • log_interval: $LOG_INTERVAL"
 echo "   • dataloader_num_workers: $DATALOADER_NUM_WORKERS"
 echo "   • seed: $SEED"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -110,9 +116,8 @@ torchrun \
     --warmup_steps $WARMUP_STEPS \
     --weight_decay $WEIGHT_DECAY \
     --max_length $MAX_LENGTH \
-    --save_steps $SAVE_STEPS \
-    --log_interval $LOG_INTERVAL \
     --dataloader_num_workers $DATALOADER_NUM_WORKERS \
+    $PROFILE_FLAG \
     --seed $SEED \
     --run_name "llama7b-safe-${TIMESTAMP}" 2>&1 | tee "$LOG_FILE"
 
