@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import csv
-import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,10 +9,6 @@ import torch
 from torch.profiler import ProfilerActivity
 from torch.utils.tensorboard import SummaryWriter
 
-from .trace_overlap import (
-    compute_comm_compute_overlap_from_trace,
-    find_latest_trace_file,
-)
 
 
 _COMM_KEYWORDS = (
@@ -149,7 +143,7 @@ def init_monitoring(args: Any, rank: int, epoch_steps: int) -> MonitoringContext
 
     约定：
     - `args.profile` 默认为 True（如果训练脚本未提供该参数，则按 True 处理，保持原行为）。
-    - `args.profile_step_time` 控制是否采集 step wall time。
+    - `args.profile_step_time` 控制是否采集 step wall time（可选；本模块不再在训练时写 summary 文件）。
     """
 
     if rank != 0:
@@ -169,8 +163,7 @@ def init_monitoring(args: Any, rank: int, epoch_steps: int) -> MonitoringContext
 
     tb_writer = SummaryWriter(log_dir=str(tb_log_dir))
 
-    # 方案A：记录整个 epoch 内的全部 step
-    active_steps = max(1, min(int(epoch_steps), 20))
+    active_steps = max(1, min(int(epoch_steps), 100))
     schedule = torch.profiler.schedule(wait=1, warmup=1, active=active_steps, repeat=1)
     prof = torch.profiler.profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -234,67 +227,13 @@ def finalize_monitoring(
 
     # 1) 停止 profiler
     if ctx.prof is not None:
-        ctx.prof.stop()
-
-        # 2) 导出通信算子摘要（rank0）
         try:
-            profiler_dir = ctx.profiler_log_dir or (Path(".") / "profiler")
-            summary = _summarize_profiler_comm_ops(ctx.prof)
-
-            # 写 JSON
-            out_json = profiler_dir / "summary_rank0.json"
-
-            overlap = None
-            try:
-                trace_path = find_latest_trace_file(profiler_dir)
-                if trace_path is not None:
-                    overlap = compute_comm_compute_overlap_from_trace(trace_path)
-            except Exception:
-                overlap = None
-
-            payload = {
-                "epoch": int(epoch),
-                "num_batches": int(num_batches),
-                "total_loss": float(total_loss),
-                "avg_loss": float(total_loss / max(1, num_batches)),
-                "step_time": _step_time_stats(ctx.step_times_ms),
-                "profiler": {
-                    "comm_ratio_cuda": summary.get("comm_ratio_cuda", 0.0),
-                    "comm_ratio_cpu": summary.get("comm_ratio_cpu", 0.0),
-                    "comm_cuda_time_ms": summary.get("comm_cuda_time_ms", 0.0),
-                    "comm_cpu_time_ms": summary.get("comm_cpu_time_ms", 0.0),
-                    "total_cuda_time_ms": summary.get("total_cuda_time_ms", 0.0),
-                    "total_cpu_time_ms": summary.get("total_cpu_time_ms", 0.0),
-                },
-                "overlap": overlap,
-            }
-            out_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-            # 写 CSV（仅 comm ops）
-            out_csv = profiler_dir / "comm_op_summary_rank0.csv"
-            with out_csv.open("w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(
-                    f,
-                    fieldnames=[
-                        "name",
-                        "count",
-                        "cpu_time_total_ms",
-                        "cuda_time_total_ms",
-                    ],
-                )
-                writer.writeheader()
-                for row in summary.get("comm_ops", []):
-                    writer.writerow(
-                        {
-                            "name": row.get("name", ""),
-                            "count": row.get("count", 0),
-                            "cpu_time_total_ms": f"{float(row.get('cpu_time_total_ms', 0.0)):.6f}",
-                            "cuda_time_total_ms": f"{float(row.get('cuda_time_total_ms', 0.0)):.6f}",
-                        }
-                    )
-        except Exception:
-            # 监控/摘要失败不应影响训练流程
-            pass
+            ctx.prof.stop()
+        except RuntimeError as exc:
+            msg = str(exc)
+            # 已知在某些版本/异常路径下会触发：Python replay stack is empty
+            if "Python replay stack is empty" not in msg:
+                raise
 
     # 3) 写 epoch loss，并关闭 TB
     if ctx.tb_writer is not None:

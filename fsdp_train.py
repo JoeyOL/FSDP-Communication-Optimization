@@ -140,7 +140,7 @@ def main():
     parser.add_argument('--num_epochs', type=int, default=3, help='训练轮数')
     parser.add_argument('--max_length', type=int, default=512, help='最大序列长度')
     parser.add_argument('--warmup_steps', type=int, default=100, help='预热步数')
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=4, help='梯度累积步数')
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='梯度累积步数')
     parser.add_argument('--weight_decay', type=float, default=0.01, help='权重衰减')
     parser.add_argument('--eval_steps', type=int, default=None, help='评估间隔步数')
     parser.add_argument('--dataloader_num_workers', type=int, default=2, help='数据加载器worker数量')
@@ -199,11 +199,11 @@ def main():
         )
     )
     #  # --- 新增：注册梯度量化通信钩子 ---
-    # if world_size > 1:  # 只在多GPU时注册
-    #     logger.info("🔧 注册梯度量化通信钩子...")
-    #     model.register_comm_hook(GradQuantState(num_bits=8),
-    #                              fsdp_quantized_comm_hook)
-    #     logger.info("✅ 梯度量化钩子注册成功 - 梯度将在通信时自动量化为8位")
+    if world_size > 1:  # 只在多GPU时注册
+        logger.info("🔧 注册梯度量化通信钩子...")
+        model.register_comm_hook(GradQuantState(num_bits=8),
+                                 fsdp_quantized_comm_hook)
+        logger.info("✅ 梯度量化钩子注册成功 - 梯度将在通信时自动量化为8位")
     
     logger.info(f"✅ Rank {rank} 模型加载完成，参数数量: {sum(p.numel() for p in model.parameters()):,}")
     

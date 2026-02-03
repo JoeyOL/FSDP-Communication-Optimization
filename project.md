@@ -48,16 +48,17 @@ chmod +x scripts/step1_profile.sh
 
 产物默认写到：
 
-- `output_dir/logs/<run_name>/profiler/summary_rank0.json`（包含通信占比与通信覆盖比/重叠率）
-- `output_dir/logs/<run_name>/profiler/comm_op_summary_rank0.csv`
-- `output_dir/logs/<run_name>/profiler/*.pt.trace.json`（TensorBoard Profiler 可视化与 overlap 计算输入）
+- `output_dir/logs/<run_name>/profiler/*.pt.trace.json`（训练阶段唯一落盘；TensorBoard Profiler 可视化与离线统计输入）
+- `output_dir/logs/<run_name>/profiler/summary_rank0.json`（离线脚本生成）
+- `output_dir/logs/<run_name>/profiler/comm_op_summary_rank0.csv`（离线脚本生成）
 
 实现说明（本仓库已固化 Step1 取证代码）：
 
 - 训练侧只保留最小接入：`train_epoch_with_monitoring(...)` 调用监控模块（rank0 生效）。
-- 耗时/取证逻辑已从训练代码中解耦到 `perf/`：
-  - `perf/comm_profiler.py`：统一负责启动/推进/结束 profiler，并写出 `summary_rank0.json` 与 `comm_op_summary_rank0.csv`。
-  - `perf/trace_overlap.py`：从 profiler 的 Chrome trace（`*.pt.trace.json`）估算通信-计算重叠（通信覆盖比）。
+- 耗时/取证逻辑已从训练代码中解耦到 `perf/`/`tools/`：
+  - `perf/comm_profiler.py`：训练侧只负责启动/推进/结束 profiler，并落盘 `*.pt.trace.json`。
+  - `perf/trace_overlap.py`：从 Chrome trace 估算通信-计算重叠（通信覆盖比；仅统计 `cat == "kernel"` 的 GPU kernel 事件）。
+  - `tools/compute_trace_stats.py`：离线读取 `*.pt.trace.json`，生成 `summary_rank0.json` 与 `comm_op_summary_rank0.csv`。
 - 启动脚本：`scripts/step1_profile.sh`（Linux），默认开启：
   - `--profile/--no-profile`：是否启用 profiler（默认启用）
   - `--profile-step-time`：额外统计每 step wall time（默认关闭，脚本中开启）
@@ -68,21 +69,16 @@ chmod +x scripts/step1_profile.sh
 本仓库 Step1 的“证据文件”主要包含两类：
 
 - `summary_rank0.json`：汇总指标（用于写结论/对比 1 卡 vs 2 卡）
-- `comm_op_summary_rank0.csv`：通信相关算子列表（用于截图/定位热点）
+- `comm_op_summary_rank0.csv`：GPU kernel 聚合列表（默认仅通信相关；用于截图/定位热点）
 
 `summary_rank0.json` 关键字段：
 
-- `step_time.*`（来源：`time.perf_counter()`，需开启 `--profile-step-time`）
-  - `mean_ms/p50_ms/p90_ms/p95_ms`：端到端每 step wall time 分布（包含计算+通信+同步+CPU 开销等）。
-  - 作用：作为“真实训练迭代耗时”口径，对比扩展性与抖动。
-- `profiler.total_cuda_time_ms / total_cpu_time_ms`（来源：`torch.profiler.profile().key_averages()` 聚合事件总和）
-  - 作用：提供被 profiler 观测到的总体事件量级（注意：不是严格意义上的 step wall time）。
-- `profiler.comm_cuda_time_ms / comm_cpu_time_ms`（来源：同上，按事件名关键词过滤）
-  - 通信事件关键词：`reduce_scatter/all_gather/all_reduce/broadcast/nccl/c10d`（近似口径）。
-- `profiler.comm_ratio_cuda / comm_ratio_cpu`
-  - 定义：通信事件累计时间 / 全部事件累计时间。
-  - 解读：2 卡相对 1 卡显著上升时，可作为“通信占比上升、成为瓶颈”的证据之一。
-- `overlap.overall.*`（来源：解析 `*.pt.trace.json` 的 GPU kernel 时间区间并计算交并集；两套口径）
+- `trace_file`：本次统计所用的 trace 文件名。
+- `comm_from_trace.*`（来源：解析 `*.pt.trace.json` 中 `cat == "kernel"` 的 GPU kernel 事件）
+  - `comm_kernel_time_ms_sum`：通信 kernel 累计时长（简单求和）。
+  - `total_kernel_time_ms_sum`：全部 kernel 累计时长（简单求和）。
+  - `comm_ratio_kernel_sum`：$\mathrm{comm\_kernel\_time\_ms\_sum} / \mathrm{total\_kernel\_time\_ms\_sum}$。
+- `overlap.overall.*`（来源：解析 `*.pt.trace.json` 的 GPU kernel 时间区间并计算交并集；两套口径，且仅统计 `cat == "kernel"`）
   - `comm_total_ms`：通信相关 GPU kernel 的区间并集总时长（近似）。
   - `compute_total_ms_loose`：非通信 GPU kernel 的区间并集总时长（近似，排除 memcpy/memset；loose 口径，偏宽）。
   - `overlap_ms_loose`：通信区间与 compute(loose) 区间的交集时长。
@@ -93,14 +89,21 @@ chmod +x scripts/step1_profile.sh
   - `comm_covered_ratio_strict`（口径A 通信覆盖比）：$\mathrm{overlap\_ms\_strict} / \mathrm{comm\_total\_ms}$。
   - `comm_exposed_ratio_strict = 1 - comm_covered_ratio_strict`：通信暴露比（strict）。
 
-`comm_op_summary_rank0.csv` 字段：
+- `scopes.*`（来源：解析 `*.pt.trace.json` 中 `record_function()` 产生的 CPU scope 事件，并按 `ProfilerStep#X` 对齐到每 step）
+  - `scopes.overall.forward_pass/backward_pass/optimizer_step`：各 scope 的 `total_ms` 与分位数统计（mean/p50/p90/p95 等）。
+  - `scopes.per_step`：每个 step 的 `forward_pass_ms/backward_pass_ms/optimizer_step_ms`，用于做抖动与趋势分析。
 
-- `name/count/cpu_time_total_ms/cuda_time_total_ms`（来源：`prof.key_averages()` 聚合）
-  - 作用：列出通信相关热点事件（用于定位 reduce-scatter / all-gather 等是否出现，以及其耗时排序）。
+`comm_op_summary_rank0.csv` 字段（GPU kernel 聚合列表）：
+
+- 默认（`scripts/step1_profile.sh`）：只导出通信相关 kernel（便于快速定位 all-gather / reduce-scatter / all-reduce）。
+- 如需导出全部 GPU kernel：用离线脚本重跑一次：
+  - `python tools/compute_trace_stats.py <trace.pt.trace.json> --out_dir <profiler_dir> --compat_rank0_names --csv_all_kernels --csv_topk 200`
+- CSV 列：`name/count/cuda_time_total_ms/is_comm`（`is_comm` 为关键词启发式判定）。
 
 注意事项（避免误解）：
 
-- `comm_ratio_*` 与 `overlap.*` 都是“关键词分类”的近似口径，适合做趋势对比（1 卡 vs 2 卡）与中期证据展示，不等价于严格的算子级因果归因。
+- `comm_ratio_kernel_sum` 与 `overlap.*` 都是“关键词分类”的近似口径，适合做趋势对比（1 卡 vs 2 卡）与中期证据展示，不等价于严格的算子级因果归因。
+- overlap 仅统计 `cat == "kernel"` 的 GPU kernel 事件；`cuda_runtime` 等范围事件不会计入。
 - profiler 采用 schedule（默认 wait/warmup/active），因此 trace 只覆盖部分 steps；建议取证时 `--max_steps >= 20`，并用相同设置对比 1 卡与 2 卡。
 
 #### 步骤 1：如何验证（复现流程与预期现象）
@@ -116,16 +119,30 @@ chmod +x scripts/step1_profile.sh
 2) 双卡做 1 vs 2 对比验证“通信占比/重叠率趋势”
 
 - 运行：`./scripts/step1_profile.sh --data_path ... --output_dir ... --nproc 2 --max_steps 50`
+- 检查：`output_dir/logs/<run_name>/profiler/` 下存在
+  - `*.pt.trace.json`（训练阶段落盘）
+  - `summary_rank0.json`、`comm_op_summary_rank0.csv`（离线脚本生成）
 - 预期（常见趋势，不同硬件/模型会有差异）：
-  - `profiler.comm_ratio_cuda`：2 卡通常高于 1 卡（通信事件占比上升）。
-  - `overlap.overall.comm_exposed_ratio_strict`：2 卡常见上升（通信更难完全隐藏）。
-  - `step_time.mean_ms`：2 卡若扩展效率不理想，会不降反升或下降幅度小。
-  - `comm_op_summary_rank0.csv` 中能看到 `reduce_scatter/all_gather/all_reduce/nccl` 相关事件出现在 top 列表。
+  - `comm_from_trace.comm_ratio_kernel_sum`：2 卡通常高于 1 卡（通信 kernel 占比上升；近似口径）。
+  - `overlap.overall.comm_exposed_ratio_strict`：2 卡常见上升（通信更难被重计算覆盖）。
+  - `comm_op_summary_rank0.csv`：能看到 all-gather / reduce-scatter / all-reduce 对应的 NCCL kernel。
+
+
+3) 两机两卡验证“多机链路与产物”
+
+- 两台机器都执行同一 `--run_name` 与同一训练参数；总卡数=2 时，通常每机 `--nproc 1`。
+- 机器0（node_rank=0，同时也是 master）：
+  - `./scripts/step1_profile.sh --data_path ... --nnodes 2 --node_rank 0 --master_addr <ip> --master_port 29500 --nproc 1 --max_steps 50 --run_name step1-2node-2gpu`
+- 机器1（node_rank=1）：
+  - `./scripts/step1_profile.sh --data_path ... --nnodes 2 --node_rank 1 --master_addr <ip> --master_port 29500 --nproc 1 --max_steps 50 --run_name step1-2node-2gpu`
+- 检查：trace 与离线统计文件只会在全局 rank0（通常 node_rank=0）那台机器的 `output_dir/logs/<run_name>/profiler/` 目录生成。
+- 建议：多机下优先在 node_rank=0 节点打开 TensorBoard/查看产物；其他节点会跳过离线统计。
 
 3) 可视化核对（推荐截图做中期材料）
 
 - `tensorboard --logdir output_dir/logs/<run_name>`
 - 打开 “PyTorch Profiler”，对比 1 卡/2 卡 step 时间线中通信相关条块占比与重叠情况。
+- 在 Trace Viewer 里搜索 `forward_pass`/`backward_pass`/`optimizer_step`，可直接看到你在代码里用 `record_function()` 打的 scope。
 
 ### 步骤 2：实现“通信压缩热插拔模块”（支持多种压缩算法）
 
