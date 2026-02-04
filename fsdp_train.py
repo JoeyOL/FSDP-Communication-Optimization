@@ -199,11 +199,11 @@ def main():
         )
     )
     #  # --- 新增：注册梯度量化通信钩子 ---
-    if world_size > 1:  # 只在多GPU时注册
-        logger.info("🔧 注册梯度量化通信钩子...")
-        model.register_comm_hook(GradQuantState(num_bits=8),
-                                 fsdp_quantized_comm_hook)
-        logger.info("✅ 梯度量化钩子注册成功 - 梯度将在通信时自动量化为8位")
+    # if world_size > 1:  # 只在多GPU时注册
+    #     logger.info("🔧 注册梯度量化通信钩子...")
+    #     model.register_comm_hook(GradQuantState(num_bits=8),
+    #                              fsdp_quantized_comm_hook)
+    #     logger.info("✅ 梯度量化钩子注册成功 - 梯度将在通信时自动量化为8位")
     
     logger.info(f"✅ Rank {rank} 模型加载完成，参数数量: {sum(p.numel() for p in model.parameters()):,}")
     

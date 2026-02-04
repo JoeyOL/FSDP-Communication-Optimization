@@ -284,7 +284,7 @@ def main() -> None:
     ap.add_argument(
         "--csv_topk",
         type=int,
-        default=0,
+        default=50,
         help="If >0, keep only top-K rows by cuda_time_total_ms.",
     )
 

@@ -30,7 +30,7 @@ Step1: 一键启动耗时取证（torch.profiler + step wall time + overlap）
 
 示例：
   # 单机 1 卡
-  ./scripts/step1_profile.sh --data_path datasets/wikipedia_en_1k.json --nproc 1
+  ./scripts/step1_profile.sh --data_path datasets/wikipedia_en_300mb.json --nproc 1
 
   # 单机 2 卡
   ./scripts/step1_profile.sh --data_path datasets/wikipedia_en_300mb.json --nproc 2 --max_steps 50
@@ -165,7 +165,7 @@ else
     echo "[WARN] no trace file found in $profiler_dir"
   else
     echo "[POST] compute trace stats: $trace_file"
-    python tools/compute_trace_stats.py "$trace_file" --out_dir "$profiler_dir" --compat_rank0_names
+    python tools/compute_trace_stats.py "$trace_file" --out_dir "$profiler_dir" --compat_rank0_names --csv_all_kernels
   fi
 fi
 
