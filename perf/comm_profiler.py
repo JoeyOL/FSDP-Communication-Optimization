@@ -163,7 +163,7 @@ def init_monitoring(args: Any, rank: int, epoch_steps: int) -> MonitoringContext
 
     tb_writer = SummaryWriter(log_dir=str(tb_log_dir))
 
-    active_steps = max(1, min(int(epoch_steps), 100))
+    active_steps = max(1, min(int(epoch_steps), 50))
     schedule = torch.profiler.schedule(wait=1, warmup=1, active=active_steps, repeat=1)
     prof = torch.profiler.profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -205,8 +205,11 @@ def step_end(ctx: MonitoringContext, args: Any, start_t: Optional[float]) -> Non
         ctx.step_times_ms.append(float(elapsed_ms))
 
     if ctx.prof is not None:
-        # 让 profiler 的 schedule 前进；否则 trace 很可能不会落盘
-        ctx.prof.step()
+        try:
+            ctx.prof.step()
+        except RuntimeError as e:
+            logger.warning(f"Profiler step failed: {e}, disabling profiler")
+            ctx.prof = None
 
 
 def should_stop_early(args: Any, global_step: int) -> bool:

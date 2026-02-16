@@ -49,7 +49,14 @@ def main() -> None:
         "--model_dir",
         type=str,
         help="训练输出的 final_model 目录；需要包含 pytorch_model.bin 和 tokenizer 文件",
-        default="./fsdp_output/final_model",
+        default="./models/gpt2",
+    )
+    parser.add_argument(
+        "--model_size",
+        type=str,
+        default="small",
+        choices=["small", "medium", "large", "xl"],
+        help="模型大小",
     )
     parser.add_argument("--max_new_tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=0.8)
@@ -74,7 +81,7 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"使用设备: {device}")
 
-    model = load_model(tokenizer)
+    model = load_model(tokenizer, model_size=args.model_size)
     state_dict = torch.load(weights_path, map_location="cpu")
     model.load_state_dict(state_dict, strict=False)
     model.to(device)

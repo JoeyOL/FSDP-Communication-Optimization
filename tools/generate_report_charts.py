@@ -41,11 +41,10 @@ def load_comm_breakdown(path):
     return total_comm_csv, rs_time, ag_time
 
 def main():
-    # 数据路径
-    base_dir = Path('/Users/bytedance/FSDP-Communication-Optimization/usefuldata')
-    double_path = base_dir / 'step1-20260204-040929-FP32-DOUBLE'
-    single_path = base_dir / 'step1-20260204-041625-FP32-SINGLE'
-    output_dir = Path('/Users/bytedance/FSDP-Communication-Optimization/report/assets')
+    base_dir = Path(__file__).parent.parent
+    double_path = base_dir / 'fsdp_output/logs/step1-20260216-113614'
+    single_path = base_dir / 'usefuldata/step1-20260204-041625-FP32-SINGLE'
+    output_dir = base_dir / 'report/assets'
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. 加载数据

@@ -2,6 +2,7 @@ import os
 import torch
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType
+from torch.distributed.fsdp import ShardingStrategy
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import (
@@ -146,6 +147,7 @@ def main():
     parser.add_argument('--dataloader_num_workers', type=int, default=2, help='数据加载器worker数量')
     parser.add_argument('--run_name', type=str, default='llama7b-fsdp-wiki', help='运行名称')
     parser.add_argument('--seed', type=int, default=42, help='随机种子')
+    parser.add_argument('--model_size', type=str, default='small', choices=['small', 'medium', 'large', 'xl'], help='模型大小')
     parser.add_argument('--dataset_shard_size', type=int, default=2000, help='预分词缓存分片大小（条数），用于大 JSON 文件')
     parser.add_argument('--dataset_max_samples', type=int, default=0, help='最多加载/预分词多少条样本（0表示全量），用于快速自检')
 
@@ -183,7 +185,7 @@ def main():
     
     tokenizer = load_tokenizer()
     
-    model = load_model(tokenizer)
+    model = load_model(tokenizer, model_size=args.model_size)
     model = model.to(f'cuda:{local_rank}')
     
     # 优化的 FSDP 配置 - 更激进的内存优化
@@ -191,6 +193,7 @@ def main():
     # 优化的 FSDP 配置
     model = FSDP(model,
         device_id=local_rank,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
         auto_wrap_policy = functools.partial(
             transformer_auto_wrap_policy,
             transformer_layer_cls={

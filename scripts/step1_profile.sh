@@ -54,10 +54,12 @@ NNODES=1
 NODE_RANK=0
 MASTER_ADDR=""
 MASTER_PORT=29500
-MAX_STEPS=105
+MAX_STEPS=55
 DATASET_MAX_SAMPLES=0
-BATCH_SIZE=16
-MAX_LENGTH=512
+BATCH_SIZE=1
+MAX_LENGTH=1024
+GRADIENT_ACCUMULATION_STEPS=1
+MODEL_SIZE="medium"
 
 PASSTHROUGH=()
 
@@ -128,6 +130,8 @@ BASE_ARGS=(
   --max_length "$MAX_LENGTH"
   --dataset_max_samples "$DATASET_MAX_SAMPLES"
   --max_steps "$MAX_STEPS"
+  --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS"
+  --model_size "$MODEL_SIZE"
   --warmup_steps 0
   --profile
   --profile_step_time

@@ -12,18 +12,30 @@ def load_tokenizer():
                                 "unk_token": "<unk>", "pad_token": "<pad>", "mask_token": "<mask>"})
     return tokenizer
 
-def load_model(tokenizer):
-    # Important: after `add_special_tokens`, `len(tokenizer)` may be larger than
-    # `tokenizer.vocab_size`. Using `tokenizer.vocab_size` can lead to token ids
-    # (e.g., pad_token_id) exceeding the embedding size and crash with
-    # CUDA indexSelect assertions.
+GPT2_MODEL_SIZES = {
+    "small": {"n_layer": 12, "n_embd": 768, "n_head": 12},
+    "medium": {"n_layer": 24, "n_embd": 1024, "n_head": 16},
+    "large": {"n_layer": 36, "n_embd": 1280, "n_head": 20},
+    "xl": {"n_layer": 48, "n_embd": 1600, "n_head": 25},
+}
+
+def load_model(tokenizer, model_size="small"):
     vocab_size = len(tokenizer)
+    
+    if model_size not in GPT2_MODEL_SIZES:
+        raise ValueError(f"Invalid model_size: {model_size}. Must be one of {list(GPT2_MODEL_SIZES.keys())}")
+    
+    size_config = GPT2_MODEL_SIZES[model_size]
     config = GPT2Config(
         vocab_size=vocab_size,
+        n_layer=size_config["n_layer"],
+        n_embd=size_config["n_embd"],
+        n_head=size_config["n_head"],
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
-        torch_dtype='float32'  # 明确指定数据类型为 float32
+        torch_dtype='float32'
     )
+    # 随机初始化的模型不是预训练的，所以不需要加载预训练的权重
     model = GPT2LMHeadModel(config)
 
     # Ensure embedding table matches tokenizer size.

@@ -25,6 +25,7 @@ WEIGHT_DECAY=0.01
 MAX_LENGTH=512
 DATALOADER_NUM_WORKERS=2
 SEED=42
+MODEL_SIZE="small"
 
 # 是否启用性能分析
 PROFILE=false
@@ -117,6 +118,7 @@ torchrun \
     --weight_decay $WEIGHT_DECAY \
     --max_length $MAX_LENGTH \
     --dataloader_num_workers $DATALOADER_NUM_WORKERS \
+    --model_size "$MODEL_SIZE" \
     $PROFILE_FLAG \
     --seed $SEED \
     --run_name "llama7b-safe-${TIMESTAMP}" 2>&1 | tee "$LOG_FILE"
