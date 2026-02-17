@@ -70,3 +70,14 @@ python chat_model.py \
 ```
 
 输入 `/exit` 退出。
+
+## 通信压缩（可选）
+
+训练时可通过 `--comm-hook` 启用通信压缩（默认关闭）：
+
+```bash
+torchrun --nproc_per_node=2 fsdp_train.py \
+	--data_path /root/llama-7b/datasets/wikipedia_en_10mb.json \
+	--output_dir /root/llama-7b/fsdp_output \
+	--comm-hook int8
+```

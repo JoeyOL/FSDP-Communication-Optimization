@@ -14,3 +14,4 @@ models/
 
 # 其他杂项
 trash/
+.vscode/

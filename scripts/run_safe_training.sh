@@ -27,6 +27,9 @@ DATALOADER_NUM_WORKERS=2
 SEED=42
 MODEL_SIZE="small"
 
+# 通信压缩
+COMM_HOOK="none"
+
 # 是否启用性能分析
 PROFILE=false
 
@@ -53,6 +56,7 @@ echo "   • weight_decay: $WEIGHT_DECAY"
 echo "   • max_length: $MAX_LENGTH"
 echo "   • dataloader_num_workers: $DATALOADER_NUM_WORKERS"
 echo "   • seed: $SEED"
+echo "   • comm_hook: $COMM_HOOK"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 # 检查GPU
@@ -119,6 +123,7 @@ torchrun \
     --max_length $MAX_LENGTH \
     --dataloader_num_workers $DATALOADER_NUM_WORKERS \
     --model_size "$MODEL_SIZE" \
+    --comm-hook "$COMM_HOOK" \
     $PROFILE_FLAG \
     --seed $SEED \
     --run_name "llama7b-safe-${TIMESTAMP}" 2>&1 | tee "$LOG_FILE"

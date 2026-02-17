@@ -27,6 +27,7 @@ from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_state_dict,
 )
+from compressor.comm_hooks import build_comm_hook
 
 
 def set_seed(seed: int) -> None:
@@ -36,70 +37,6 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-class GradQuantState:
-    def __init__(self, num_bits: int = 8):
-        self.num_bits = num_bits
-
-def fsdp_quantized_comm_hook(
-    state: GradQuantState,
-    full_flat_grad: torch.Tensor,
-    shard_out: torch.Tensor,
-) -> None:
-    """
-    FSDP 通信钩子，根据官方文档修正。
-    在 reduce-scatter 前进行 int8 对称量化，通信后反量化，并将结果写入 shard_out。
-    此函数不返回值。
-
-    Args:
-        state (GradQuantState): 包含量化位数的自定义状态对象。
-        full_flat_grad (torch.Tensor): FSDP 传入的完整、扁平化的梯度。
-        shard_out (torch.Tensor): 一个预先分配好的缓冲区，用于存储此 rank 的梯度分片结果。
-    """
-    assert isinstance(state, GradQuantState)
-    pg = dist.group.WORLD  # 使用默认的全局进程组
-    world_size = dist.get_world_size(pg)
-
-    # 如果只有一个 GPU，则无需通信，直接复制梯度分片
-    if world_size == 1:
-        shard_out.copy_(full_flat_grad)
-        return
-
-    # 展平梯度 (虽然已是扁平的，但确保 view 正确)
-    g = full_flat_grad.contiguous().view(-1)
-    numel = g.numel()
-    assert numel % world_size == 0, f"扁平梯度大小 {numel} 必须能被 world_size {world_size} 整除"
-
-    # 1) 全局 max_abs 同步，以确定统一的量化尺度
-    local_max = g.abs().max().to(torch.float32)
-    global_max = local_max.clone()
-    dist.all_reduce(global_max, op=dist.ReduceOp.MAX, group=pg)
-
-    # 2) 对称量化到 int8 (带有 world_size 安全上限，保证 int8 规约不溢出)
-    Q = 127
-    # 计算每个 rank 的量化范围，确保所有 rank 的量化值相加后不会超过 int8 的范围
-    Qr = max(1, Q // world_size)
-    scale = Qr / torch.clamp(global_max, min=1e-8)   # x * scale 的范围在 [-Qr, Qr]
-    q = torch.clamp((g * scale).round(), -Qr, Qr).to(torch.int8)
-    
-    temp_shard_out = torch.empty_like(shard_out, dtype=torch.int8)
-
-    # 3) 直接使用 int8 类型进行 reduce-scatter(sum) 通信
-    if hasattr(dist, "reduce_scatter_tensor"):
-        # PyTorch 较新版本
-        dist.reduce_scatter_tensor(temp_shard_out, q, op=dist.ReduceOp.SUM, group=pg)
-    else:
-        # 兼容较老版本
-        chunks = list(q.chunk(world_size, dim=0))
-        dist.reduce_scatter(temp_shard_out, chunks, op=dist.ReduceOp.SUM, group=pg)
-
-    # 4) 反量化并求平均，然后将最终结果写入 shard_out
-    deq_sum = temp_shard_out.float() / scale  # 恢复到 float 类型，近似于原始梯度的和
-    deq_avg = (deq_sum / float(world_size)).to(full_flat_grad.dtype) # 求平均并转回原始精度
-    shard_out.copy_(deq_avg)
-    return
-
 
 
 
@@ -150,6 +87,13 @@ def main():
     parser.add_argument('--model_size', type=str, default='small', choices=['small', 'medium', 'large', 'xl'], help='模型大小')
     parser.add_argument('--dataset_shard_size', type=int, default=2000, help='预分词缓存分片大小（条数），用于大 JSON 文件')
     parser.add_argument('--dataset_max_samples', type=int, default=0, help='最多加载/预分词多少条样本（0表示全量），用于快速自检')
+    parser.add_argument(
+        '--comm-hook',
+        type=str,
+        default='none',
+        choices=['none', 'int8'],
+        help='FSDP 通信压缩 hook（默认 none）',
+    )
 
     # --- Step1/取证：耗时 profiling 与短跑 ---
     parser.add_argument(
@@ -201,12 +145,11 @@ def main():
             }
         )
     )
-    #  # --- 新增：注册梯度量化通信钩子 ---
-    # if world_size > 1:  # 只在多GPU时注册
-    #     logger.info("🔧 注册梯度量化通信钩子...")
-    #     model.register_comm_hook(GradQuantState(num_bits=8),
-    #                              fsdp_quantized_comm_hook)
-    #     logger.info("✅ 梯度量化钩子注册成功 - 梯度将在通信时自动量化为8位")
+    comm_state, comm_hook = build_comm_hook(args.comm_hook)
+    if comm_hook is not None and world_size > 1:
+        logger.info(f"🔧 注册通信压缩 hook: {args.comm_hook}")
+        model.register_comm_hook(comm_state, comm_hook)
+        logger.info("✅ 通信压缩 hook 注册成功")
     
     logger.info(f"✅ Rank {rank} 模型加载完成，参数数量: {sum(p.numel() for p in model.parameters()):,}")
     

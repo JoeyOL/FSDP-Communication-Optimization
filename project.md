@@ -148,6 +148,8 @@ chmod +x scripts/step1_profile.sh
 
 目标：把压缩算法从训练脚本中解耦出来，形成可配置/可扩展的模块，并能以“开关 + 配置”方式在 FSDP 通信路径上启用。
 
+当前进展：通信压缩 hook 已模块化到 `compressor/comm_hooks.py`，训练入口支持 `--comm-hook {none,int8}`（默认 none）。
+
 验收要求：
 
 - 训练脚本支持命令行选择压缩算法，例如：`--comm_compress {none,int8,fp16,qsgd,nc,topk,randomk,thresholdv,sketch,gradiveq,signsgd,onebit,...}`（名称可再统一）。

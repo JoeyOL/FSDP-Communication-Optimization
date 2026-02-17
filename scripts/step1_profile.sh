@@ -22,6 +22,7 @@ Step1: 一键启动耗时取证（torch.profiler + step wall time + overlap）
   --dataset_max_samples N     加载样本上限（默认 200）
   --batch_size N              batch size（默认 2）
   --max_length N              序列长度（默认 128）
+  --comm_hook NAME            通信压缩 hook（默认 none）
 
 产物：
   <output_dir>/logs/<run_name>/profiler/*.pt.trace.json
@@ -59,7 +60,8 @@ DATASET_MAX_SAMPLES=0
 BATCH_SIZE=1
 MAX_LENGTH=1024
 GRADIENT_ACCUMULATION_STEPS=1
-MODEL_SIZE="medium"
+MODEL_SIZE="large"
+COMM_HOOK="none"
 
 PASSTHROUGH=()
 
@@ -95,6 +97,8 @@ while [[ $# -gt 0 ]]; do
       MAX_LENGTH="$2"; shift 2 ;;
     --model_size)
       MODEL_SIZE="$2"; shift 2 ;;
+    --comm_hook)
+      COMM_HOOK="$2"; shift 2 ;;
     --)
       shift
       PASSTHROUGH+=("$@")
@@ -139,6 +143,7 @@ cat > "$LOG_DIR/config.json" << EOF
   "warmup_steps": 0,
   "nproc": ${NPROC},
   "nnodes": ${NNODES},
+  "comm_hook": "${COMM_HOOK}",
   "timestamp": "$(date -Iseconds)"
 }
 EOF
@@ -158,6 +163,7 @@ BASE_ARGS=(
   --max_steps "$MAX_STEPS"
   --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS"
   --model_size "$MODEL_SIZE"
+  --comm-hook "$COMM_HOOK"
   --warmup_steps 0
   --profile
   --profile_step_time
