@@ -93,6 +93,8 @@ while [[ $# -gt 0 ]]; do
       BATCH_SIZE="$2"; shift 2 ;;
     --max_length)
       MAX_LENGTH="$2"; shift 2 ;;
+    --model_size)
+      MODEL_SIZE="$2"; shift 2 ;;
     --)
       shift
       PASSTHROUGH+=("$@")
@@ -117,6 +119,30 @@ if [[ -z "$RUN_NAME" ]]; then
 fi
 
 mkdir -p "$OUTPUT_DIR"
+
+
+LOG_DIR="${OUTPUT_DIR}/logs/${RUN_NAME}"
+mkdir -p "$LOG_DIR"
+
+cat > "$LOG_DIR/config.json" << EOF
+{
+  "run_name": "${RUN_NAME}",
+  "data_path": "${DATA_PATH}",
+  "output_dir": "${OUTPUT_DIR}",
+  "num_epochs": 1,
+  "batch_size": ${BATCH_SIZE},
+  "max_length": ${MAX_LENGTH},
+  "dataset_max_samples": ${DATASET_MAX_SAMPLES},
+  "max_steps": ${MAX_STEPS},
+  "gradient_accumulation_steps": ${GRADIENT_ACCUMULATION_STEPS},
+  "model_size": "${MODEL_SIZE}",
+  "warmup_steps": 0,
+  "nproc": ${NPROC},
+  "nnodes": ${NNODES},
+  "timestamp": "$(date -Iseconds)"
+}
+EOF
+echo "[CONFIG] Saved config to ${LOG_DIR}/config.json"
 
 # NOTE: torchrun expects the training script/module directly (e.g. fsdp_train.py),
 # not a nested "python fsdp_train.py" command.
