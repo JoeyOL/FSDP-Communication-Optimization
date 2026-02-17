@@ -1,0 +1,16 @@
+{
+  "run_name": "step1-20260216-124501",
+  "data_path": "datasets/wikipedia_en_300mb.json",
+  "output_dir": "/root/llama-7b/fsdp_output",
+  "num_epochs": 1,
+  "batch_size": 1,
+  "max_length": 1024,
+  "dataset_max_samples": 0,
+  "max_steps": 55,
+  "gradient_accumulation_steps": 1,
+  "model_size": "medium",
+  "warmup_steps": 0,
+  "nproc": 1,
+  "nnodes": 1,
+  "timestamp": "2026-02-16T12:45:01+00:00"
+}

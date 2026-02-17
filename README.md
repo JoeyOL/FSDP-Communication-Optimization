@@ -1,5 +1,21 @@
 # FSDP-Communication-Optimization
 
+## 环境配置
+
+使用已导出的 conda 环境文件进行创建与激活：
+
+```bash
+conda env create -f environment.yml
+conda activate <环境名>
+```
+
+如果需要更新导出的环境文件：
+
+```bash
+conda env export > environment.yml
+```
+
+
 ## 生成 Wikipedia 英文训练数据集（可复现）
 
 本项目的 `WikipediaDataset` 期望输入为 **JSON 数组**，每条样本包含：`id/title/text`。

@@ -2,6 +2,7 @@ import os
 import torch
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType
+from torch.distributed.fsdp import ShardingStrategy
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import (
@@ -136,20 +137,39 @@ def main():
     parser.add_argument('--data_path', type=str, default='/root/llama-7b/datasets/wikipedia_en_10mb.json', help='数据集路径')
     parser.add_argument('--output_dir', type=str, default='/root/llama-7b/fsdp_output', help='输出目录')
     parser.add_argument('--batch_size', type=int, default=2, help='批量大小')
-    parser.add_argument('--learning_rate', type=float, default=1e-6, help='学习率')
+    parser.add_argument('--learning_rate', type=float, default=6e-5, help='学习率')
     parser.add_argument('--num_epochs', type=int, default=3, help='训练轮数')
     parser.add_argument('--max_length', type=int, default=512, help='最大序列长度')
     parser.add_argument('--warmup_steps', type=int, default=100, help='预热步数')
-    parser.add_argument('--save_steps', type=int, default=500, help='保存间隔')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='梯度累积步数')
     parser.add_argument('--weight_decay', type=float, default=0.01, help='权重衰减')
-    parser.add_argument('--log_interval', type=int, default=10, help='日志输出间隔')
     parser.add_argument('--eval_steps', type=int, default=None, help='评估间隔步数')
     parser.add_argument('--dataloader_num_workers', type=int, default=2, help='数据加载器worker数量')
     parser.add_argument('--run_name', type=str, default='llama7b-fsdp-wiki', help='运行名称')
     parser.add_argument('--seed', type=int, default=42, help='随机种子')
+    parser.add_argument('--model_size', type=str, default='small', choices=['small', 'medium', 'large', 'xl'], help='模型大小')
     parser.add_argument('--dataset_shard_size', type=int, default=2000, help='预分词缓存分片大小（条数），用于大 JSON 文件')
     parser.add_argument('--dataset_max_samples', type=int, default=0, help='最多加载/预分词多少条样本（0表示全量），用于快速自检')
+
+    # --- Step1/取证：耗时 profiling 与短跑 ---
+    parser.add_argument(
+        '--profile',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='是否启用 torch.profiler（默认启用；可用 --no-profile 关闭）',
+    )
+    parser.add_argument(
+        '--profile_step_time',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help='是否额外统计每 step 的 wall time（默认关闭）',
+    )
+    parser.add_argument(
+        '--max_steps',
+        type=int,
+        default=0,
+        help='最多训练多少个 step（跨 epoch 计数；0 表示不限制）',
+    )
     
     args = parser.parse_args()
     
@@ -165,7 +185,7 @@ def main():
     
     tokenizer = load_tokenizer()
     
-    model = load_model(tokenizer)
+    model = load_model(tokenizer, model_size=args.model_size)
     model = model.to(f'cuda:{local_rank}')
     
     # 优化的 FSDP 配置 - 更激进的内存优化
@@ -173,6 +193,7 @@ def main():
     # 优化的 FSDP 配置
     model = FSDP(model,
         device_id=local_rank,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
         auto_wrap_policy = functools.partial(
             transformer_auto_wrap_policy,
             transformer_layer_cls={
