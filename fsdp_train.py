@@ -134,6 +134,12 @@ def main():
         default=0,
         help='最多训练多少个 step（跨 epoch 计数；0 表示不限制）',
     )
+    parser.add_argument(
+        '--comm_onebit_use_cpp',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='1-bit Seide 是否使用 C++/CUDA 扩展实现（默认使用，可通过 --no-comm-onebit-use-cpp 关闭）',
+    )
     
     args = parser.parse_args()
     
@@ -181,6 +187,7 @@ def main():
         sketch_two_round=getattr(args, 'comm_sketch_two_round', False),
         onebit_col_size=getattr(args, 'comm_onebit_col_size', 256),
         signsgd_use_delta=getattr(args, 'comm_signsgd_use_delta', False),
+        onebit_use_cpp=getattr(args, 'comm_onebit_use_cpp', True),
     )
     if comm_hook is not None and world_size > 1:
         logger.info(f"🔧 注册通信压缩 hook: {args.comm_hook}")

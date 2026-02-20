@@ -38,6 +38,7 @@ COMM_THRESHOLD_V=""
 COMM_THRESHOLD_V_NEG=""
 COMM_INT8_VARIANT="linear"
 COMM_ONEBIT_COL_SIZE=256
+COMM_ONEBIT_USE_CPP=1        # 1 = 默认启用 C++/CUDA 补丁；空 = 关闭
 COMM_SIGNSGD_USE_DELTA=""
 COMM_SKETCH_TWO_ROUND=""
 
@@ -127,6 +128,7 @@ COMM_EXTRA=()
 COMM_EXTRA+=(--comm-qsgd-s "$COMM_QSGD_S" --comm-qsgd-bucket-size "$COMM_QSGD_BUCKET_SIZE")
 COMM_EXTRA+=(--comm-topk-ratio "$COMM_TOPK_RATIO" --comm-int8-variant "$COMM_INT8_VARIANT")
 COMM_EXTRA+=(--comm-onebit-col-size "$COMM_ONEBIT_COL_SIZE")
+[[ -z "$COMM_ONEBIT_USE_CPP" ]] && COMM_EXTRA+=(--no-comm-onebit-use-cpp)
 [[ -n "$COMM_THRESHOLD_V" ]] && COMM_EXTRA+=(--comm-threshold-v "$COMM_THRESHOLD_V")
 [[ -n "$COMM_THRESHOLD_V_NEG" ]] && COMM_EXTRA+=(--comm-threshold-v-neg "$COMM_THRESHOLD_V_NEG")
 [[ -n "$COMM_SIGNSGD_USE_DELTA" ]] && COMM_EXTRA+=(--comm-signsgd-use-delta)

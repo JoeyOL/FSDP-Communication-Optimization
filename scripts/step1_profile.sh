@@ -32,6 +32,7 @@ Step1: 一键启动耗时取证（torch.profiler + step wall time + overlap）
   --comm_threshold_v_neg V    Threshold-v 负侧阈值（缺省与 v 对称）
   --comm_int8_variant V       INT8 变体：linear 或 dynamic_tree
   --comm_onebit_col_size N    1-bit Seide 列大小（默认 256）
+  --no_comm_onebit_use_cpp    关闭 1-bit Seide 的 C++/CUDA 扩展（默认开启）
   --comm_signsgd_use_delta    SignSGD 仅传方向、步长用 lr
   --comm_sketch_two_round     Sketched-SGD 两轮 + HEAVYMIX
   其他压缩参数可通过 -- 透传，例如: -- --comm-error-feedback
@@ -73,18 +74,19 @@ BATCH_SIZE=1
 MAX_LENGTH=1024
 GRADIENT_ACCUMULATION_STEPS=1
 MODEL_SIZE="medium"
-COMM_HOOK="none"
-COMM_ERROR_FEEDBACK=""
-COMM_SPARSE_COMM="yes"
-COMM_QSGD_S=4
-COMM_QSGD_BUCKET_SIZE=0
-COMM_TOPK_RATIO=0.01
-COMM_THRESHOLD_V=""
-COMM_THRESHOLD_V_NEG=""
-COMM_INT8_VARIANT="linear"
-COMM_ONEBIT_COL_SIZE=256
-COMM_SIGNSGD_USE_DELTA=""
-COMM_SKETCH_TWO_ROUND=""
+COMM_HOOK="none"              # 通信压缩算法名称（none/int8/qsgd/onebit_seide/...）
+COMM_ERROR_FEEDBACK=""        # 非空则启用误差反馈（EF）
+COMM_SPARSE_COMM="yes"        # 非空则使用稀疏通信（indices+values），空则传 full tensor
+COMM_QSGD_S=4                 # QSGD 量化等级 s（如 2/4/8）
+COMM_QSGD_BUCKET_SIZE=0       # QSGD 分桶大小，0 表示整向量一桶
+COMM_TOPK_RATIO=0.01          # Top-k/Random-k/Threshold/Sketch 等的稀疏比例
+COMM_THRESHOLD_V=""           # Threshold-v 正向阈值（为空则用 ratio 分位数）
+COMM_THRESHOLD_V_NEG=""       # Threshold-v 负向阈值（为空则与正向对称）
+COMM_INT8_VARIANT="linear"    # INT8 变体：linear 或 dynamic_tree
+COMM_ONEBIT_COL_SIZE=256      # 1-bit Seide 的列大小（每列元素数）
+COMM_ONEBIT_USE_CPP=1         # 1 = 默认启用 C++/CUDA 补丁；空 = 关闭（纯 Python 实现）
+COMM_SIGNSGD_USE_DELTA=""     # 非空则 SignSGD 只传方向，由 lr 决定步长
+COMM_SKETCH_TWO_ROUND=""      # 非空则 Sketched-SGD 启用两轮通信 + HEAVYMIX
 
 PASSTHROUGH=()
 
@@ -140,6 +142,8 @@ while [[ $# -gt 0 ]]; do
       COMM_INT8_VARIANT="$2"; shift 2 ;;
     --comm_onebit_col_size)
       COMM_ONEBIT_COL_SIZE="$2"; shift 2 ;;
+    --no_comm_onebit_use_cpp)
+      COMM_ONEBIT_USE_CPP=""; shift 1 ;;
     --comm_signsgd_use_delta)
       COMM_SIGNSGD_USE_DELTA=1; shift 1 ;;
     --comm_sketch_two_round)
@@ -196,6 +200,7 @@ cat > "$LOG_DIR/config.json" << EOF
   "comm_topk_ratio": ${COMM_TOPK_RATIO},
   "comm_int8_variant": "${COMM_INT8_VARIANT}",
   "comm_onebit_col_size": ${COMM_ONEBIT_COL_SIZE},
+  "comm_onebit_use_cpp": $([ -n "$COMM_ONEBIT_USE_CPP" ] && echo true || echo false),
   "timestamp": "$(date -Iseconds)"
 }
 EOF
@@ -208,6 +213,7 @@ COMM_EXTRA=()
 COMM_EXTRA+=(--comm-qsgd-s "$COMM_QSGD_S" --comm-qsgd-bucket-size "$COMM_QSGD_BUCKET_SIZE")
 COMM_EXTRA+=(--comm-topk-ratio "$COMM_TOPK_RATIO" --comm-int8-variant "$COMM_INT8_VARIANT")
 COMM_EXTRA+=(--comm-onebit-col-size "$COMM_ONEBIT_COL_SIZE")
+[[ -z "$COMM_ONEBIT_USE_CPP" ]] && COMM_EXTRA+=(--no-comm-onebit-use-cpp)
 [[ -n "$COMM_THRESHOLD_V" ]] && COMM_EXTRA+=(--comm-threshold-v "$COMM_THRESHOLD_V")
 [[ -n "$COMM_THRESHOLD_V_NEG" ]] && COMM_EXTRA+=(--comm-threshold-v-neg "$COMM_THRESHOLD_V_NEG")
 [[ -n "$COMM_SIGNSGD_USE_DELTA" ]] && COMM_EXTRA+=(--comm-signsgd-use-delta)
