@@ -23,6 +23,18 @@ Step1: 一键启动耗时取证（torch.profiler + step wall time + overlap）
   --batch_size N              batch size（默认 2）
   --max_length N              序列长度（默认 128）
   --comm_hook NAME            通信压缩 hook（默认 none）
+  --comm_error_feedback       启用误差反馈（EF）
+  --no_comm_sparse_comm       关闭稀疏通信（indices+values）
+  --comm_qsgd_s N             QSGD 水平数 s（默认 4）
+  --comm_qsgd_bucket_size N   QSGD 桶大小（0=整向量，如 512）
+  --comm_topk_ratio R         Top-k/Random-k/Threshold 稀疏比例（默认 0.01）
+  --comm_threshold_v V        Threshold-v 正侧阈值（0=用 ratio 分位数）
+  --comm_threshold_v_neg V    Threshold-v 负侧阈值（缺省与 v 对称）
+  --comm_int8_variant V       INT8 变体：linear 或 dynamic_tree
+  --comm_onebit_col_size N    1-bit Seide 列大小（默认 256）
+  --comm_signsgd_use_delta    SignSGD 仅传方向、步长用 lr
+  --comm_sketch_two_round     Sketched-SGD 两轮 + HEAVYMIX
+  其他压缩参数可通过 -- 透传，例如: -- --comm-error-feedback
 
 产物：
   <output_dir>/logs/<run_name>/profiler/*.pt.trace.json
@@ -60,8 +72,19 @@ DATASET_MAX_SAMPLES=0
 BATCH_SIZE=1
 MAX_LENGTH=1024
 GRADIENT_ACCUMULATION_STEPS=1
-MODEL_SIZE="large"
+MODEL_SIZE="medium"
 COMM_HOOK="none"
+COMM_ERROR_FEEDBACK=""
+COMM_SPARSE_COMM="yes"
+COMM_QSGD_S=4
+COMM_QSGD_BUCKET_SIZE=0
+COMM_TOPK_RATIO=0.01
+COMM_THRESHOLD_V=""
+COMM_THRESHOLD_V_NEG=""
+COMM_INT8_VARIANT="linear"
+COMM_ONEBIT_COL_SIZE=256
+COMM_SIGNSGD_USE_DELTA=""
+COMM_SKETCH_TWO_ROUND=""
 
 PASSTHROUGH=()
 
@@ -99,6 +122,28 @@ while [[ $# -gt 0 ]]; do
       MODEL_SIZE="$2"; shift 2 ;;
     --comm_hook)
       COMM_HOOK="$2"; shift 2 ;;
+    --comm_error_feedback)
+      COMM_ERROR_FEEDBACK=1; shift 1 ;;
+    --no_comm_sparse_comm)
+      COMM_SPARSE_COMM=""; shift 1 ;;
+    --comm_qsgd_s)
+      COMM_QSGD_S="$2"; shift 2 ;;
+    --comm_qsgd_bucket_size)
+      COMM_QSGD_BUCKET_SIZE="$2"; shift 2 ;;
+    --comm_topk_ratio)
+      COMM_TOPK_RATIO="$2"; shift 2 ;;
+    --comm_threshold_v)
+      COMM_THRESHOLD_V="$2"; shift 2 ;;
+    --comm_threshold_v_neg)
+      COMM_THRESHOLD_V_NEG="$2"; shift 2 ;;
+    --comm_int8_variant)
+      COMM_INT8_VARIANT="$2"; shift 2 ;;
+    --comm_onebit_col_size)
+      COMM_ONEBIT_COL_SIZE="$2"; shift 2 ;;
+    --comm_signsgd_use_delta)
+      COMM_SIGNSGD_USE_DELTA=1; shift 1 ;;
+    --comm_sketch_two_round)
+      COMM_SKETCH_TWO_ROUND=1; shift 1 ;;
     --)
       shift
       PASSTHROUGH+=("$@")
@@ -144,10 +189,29 @@ cat > "$LOG_DIR/config.json" << EOF
   "nproc": ${NPROC},
   "nnodes": ${NNODES},
   "comm_hook": "${COMM_HOOK}",
+  "comm_error_feedback": $([ -n "$COMM_ERROR_FEEDBACK" ] && echo true || echo false),
+  "comm_sparse_comm": $([ -n "$COMM_SPARSE_COMM" ] && echo true || echo false),
+  "comm_qsgd_s": ${COMM_QSGD_S},
+  "comm_qsgd_bucket_size": ${COMM_QSGD_BUCKET_SIZE},
+  "comm_topk_ratio": ${COMM_TOPK_RATIO},
+  "comm_int8_variant": "${COMM_INT8_VARIANT}",
+  "comm_onebit_col_size": ${COMM_ONEBIT_COL_SIZE},
   "timestamp": "$(date -Iseconds)"
 }
 EOF
 echo "[CONFIG] Saved config to ${LOG_DIR}/config.json"
+
+# 压缩相关参数（透传到 fsdp_train.py）
+COMM_EXTRA=()
+[[ -n "$COMM_ERROR_FEEDBACK" ]] && COMM_EXTRA+=(--comm-error-feedback)
+[[ -n "$COMM_SPARSE_COMM" ]] && COMM_EXTRA+=(--comm-sparse-comm) || COMM_EXTRA+=(--no-comm-sparse-comm)
+COMM_EXTRA+=(--comm-qsgd-s "$COMM_QSGD_S" --comm-qsgd-bucket-size "$COMM_QSGD_BUCKET_SIZE")
+COMM_EXTRA+=(--comm-topk-ratio "$COMM_TOPK_RATIO" --comm-int8-variant "$COMM_INT8_VARIANT")
+COMM_EXTRA+=(--comm-onebit-col-size "$COMM_ONEBIT_COL_SIZE")
+[[ -n "$COMM_THRESHOLD_V" ]] && COMM_EXTRA+=(--comm-threshold-v "$COMM_THRESHOLD_V")
+[[ -n "$COMM_THRESHOLD_V_NEG" ]] && COMM_EXTRA+=(--comm-threshold-v-neg "$COMM_THRESHOLD_V_NEG")
+[[ -n "$COMM_SIGNSGD_USE_DELTA" ]] && COMM_EXTRA+=(--comm-signsgd-use-delta)
+[[ -n "$COMM_SKETCH_TWO_ROUND" ]] && COMM_EXTRA+=(--comm-sketch-two-round)
 
 # NOTE: torchrun expects the training script/module directly (e.g. fsdp_train.py),
 # not a nested "python fsdp_train.py" command.
@@ -164,6 +228,7 @@ BASE_ARGS=(
   --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS"
   --model_size "$MODEL_SIZE"
   --comm-hook "$COMM_HOOK"
+  "${COMM_EXTRA[@]}"
   --warmup_steps 0
   --profile
   --profile_step_time

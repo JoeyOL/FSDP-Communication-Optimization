@@ -91,9 +91,29 @@ def main():
         '--comm-hook',
         type=str,
         default='none',
-        choices=['none', 'int8'],
-        help='FSDP 通信压缩 hook（默认 none）',
+        help='FSDP 通信压缩 hook: none, int8, fp16, qsgd, signsgd, onebit, onebit_seide, nc, topk, randomk, thresholdv, sketch, hybrid_topk_int8',
     )
+    parser.add_argument('--comm-onebit-col-size', type=int, default=256, help='1-bit Seide 按列重建时的列大小')
+    parser.add_argument('--comm-int8-variant', type=str, default='linear', choices=['linear', 'dynamic_tree'], help='INT8 变体: linear 或 dynamic_tree')
+    parser.add_argument('--comm-signsgd-use-delta', action='store_true', help='SignSGD 使用 δ（学习率）作为步长，仅传方向')
+    parser.add_argument(
+        '--comm-error-feedback',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help='是否启用误差反馈（与量化/稀疏化结合）',
+    )
+    parser.add_argument(
+        '--comm-sparse-comm',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='稀疏算法(topk/randomk/thresholdv)是否用稀疏通信(只传 indices+values)，默认开启',
+    )
+    parser.add_argument('--comm-qsgd-s', type=int, default=4, help='QSGD 量化水平数 s')
+    parser.add_argument('--comm-qsgd-bucket-size', type=int, default=0, help='QSGD 桶大小（0=整向量一桶，如512按桶独立scale）')
+    parser.add_argument('--comm-topk-ratio', type=float, default=0.01, help='Top-k/Random-k/Threshold 稀疏比例（k=ratio*numel）')
+    parser.add_argument('--comm-threshold-v', type=float, default=0.0, help='Threshold-v 正侧阈值 v_pos（0 则用 ratio 分位数）')
+    parser.add_argument('--comm-threshold-v-neg', type=float, default=None, help='Threshold-v 负侧阈值 v_neg（缺省与 v 对称）')
+    parser.add_argument('--comm-sketch-two-round', action='store_true', help='Sketched-SGD 两轮通信 + HEAVYMIX')
 
     # --- Step1/取证：耗时 profiling 与短跑 ---
     parser.add_argument(
@@ -145,7 +165,23 @@ def main():
             }
         )
     )
-    comm_state, comm_hook = build_comm_hook(args.comm_hook)
+    comm_state, comm_hook = build_comm_hook(
+        args.comm_hook,
+        error_feedback=getattr(args, 'comm_error_feedback', False),
+        int8_variant=getattr(args, 'comm_int8_variant', 'linear'),
+        sparse_comm=getattr(args, 'comm_sparse_comm', True),
+        qsgd_s=getattr(args, 'comm_qsgd_s', 4),
+        qsgd_bucket_size=getattr(args, 'comm_qsgd_bucket_size', 0),
+        topk_ratio=getattr(args, 'comm_topk_ratio', 0.01),
+        randomk_ratio=getattr(args, 'comm_topk_ratio', 0.01),
+        threshold_ratio=getattr(args, 'comm_topk_ratio', 0.01),
+        threshold_v=getattr(args, 'comm_threshold_v', 0.0),
+        threshold_v_neg=getattr(args, 'comm_threshold_v_neg', None),
+        sketch_ratio=getattr(args, 'comm_topk_ratio', 0.01),
+        sketch_two_round=getattr(args, 'comm_sketch_two_round', False),
+        onebit_col_size=getattr(args, 'comm_onebit_col_size', 256),
+        signsgd_use_delta=getattr(args, 'comm_signsgd_use_delta', False),
+    )
     if comm_hook is not None and world_size > 1:
         logger.info(f"🔧 注册通信压缩 hook: {args.comm_hook}")
         model.register_comm_hook(comm_state, comm_hook)

@@ -27,8 +27,19 @@ DATALOADER_NUM_WORKERS=2
 SEED=42
 MODEL_SIZE="small"
 
-# 通信压缩
+# 通信压缩（与 fsdp_train.py 一致）
 COMM_HOOK="none"
+COMM_ERROR_FEEDBACK=""           # 设为 1 启用误差反馈
+COMM_SPARSE_COMM="yes"          # 稀疏算法用 indices+values，空则 --no-comm-sparse-comm
+COMM_QSGD_S=4
+COMM_QSGD_BUCKET_SIZE=0
+COMM_TOPK_RATIO=0.01
+COMM_THRESHOLD_V=""
+COMM_THRESHOLD_V_NEG=""
+COMM_INT8_VARIANT="linear"
+COMM_ONEBIT_COL_SIZE=256
+COMM_SIGNSGD_USE_DELTA=""
+COMM_SKETCH_TWO_ROUND=""
 
 # 是否启用性能分析
 PROFILE=false
@@ -57,6 +68,9 @@ echo "   • max_length: $MAX_LENGTH"
 echo "   • dataloader_num_workers: $DATALOADER_NUM_WORKERS"
 echo "   • seed: $SEED"
 echo "   • comm_hook: $COMM_HOOK"
+echo "   • comm_error_feedback: ${COMM_ERROR_FEEDBACK:-off}"
+echo "   • comm_sparse_comm: ${COMM_SPARSE_COMM:-off}"
+echo "   • comm_qsgd_s: $COMM_QSGD_S, comm_topk_ratio: $COMM_TOPK_RATIO"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 # 检查GPU
@@ -106,6 +120,18 @@ sleep 3
 echo "🚀 开始安全双GPU训练..."
 echo "📝 日志文件: $LOG_FILE"
 
+# 压缩参数（透传）
+COMM_EXTRA=()
+[[ -n "$COMM_ERROR_FEEDBACK" ]] && COMM_EXTRA+=(--comm-error-feedback)
+[[ -n "$COMM_SPARSE_COMM" ]] && COMM_EXTRA+=(--comm-sparse-comm) || COMM_EXTRA+=(--no-comm-sparse-comm)
+COMM_EXTRA+=(--comm-qsgd-s "$COMM_QSGD_S" --comm-qsgd-bucket-size "$COMM_QSGD_BUCKET_SIZE")
+COMM_EXTRA+=(--comm-topk-ratio "$COMM_TOPK_RATIO" --comm-int8-variant "$COMM_INT8_VARIANT")
+COMM_EXTRA+=(--comm-onebit-col-size "$COMM_ONEBIT_COL_SIZE")
+[[ -n "$COMM_THRESHOLD_V" ]] && COMM_EXTRA+=(--comm-threshold-v "$COMM_THRESHOLD_V")
+[[ -n "$COMM_THRESHOLD_V_NEG" ]] && COMM_EXTRA+=(--comm-threshold-v-neg "$COMM_THRESHOLD_V_NEG")
+[[ -n "$COMM_SIGNSGD_USE_DELTA" ]] && COMM_EXTRA+=(--comm-signsgd-use-delta)
+[[ -n "$COMM_SKETCH_TWO_ROUND" ]] && COMM_EXTRA+=(--comm-sketch-two-round)
+
 # 启动训练并记录日志
 torchrun \
     --nproc_per_node=$GPU_COUNT \
@@ -124,6 +150,7 @@ torchrun \
     --dataloader_num_workers $DATALOADER_NUM_WORKERS \
     --model_size "$MODEL_SIZE" \
     --comm-hook "$COMM_HOOK" \
+    "${COMM_EXTRA[@]}" \
     $PROFILE_FLAG \
     --seed $SEED \
     --run_name "llama7b-safe-${TIMESTAMP}" 2>&1 | tee "$LOG_FILE"
