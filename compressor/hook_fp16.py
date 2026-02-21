@@ -5,8 +5,9 @@ from .common import _apply_error_feedback, _ensure_residual
 
 
 class FP16State:
-    def __init__(self, error_feedback: bool = False) -> None:
+    def __init__(self, error_feedback: bool = False, ef_local: bool = False) -> None:
         self.error_feedback = error_feedback
+        self._ef_local = ef_local
 
 
 def fsdp_fp16_comm_hook(
@@ -24,8 +25,11 @@ def fsdp_fp16_comm_hook(
 
     g = full_flat_grad.contiguous().view(-1)
     if state.error_feedback:
-        residual = _ensure_residual(state, g)
-        g = (g + residual).to(g.dtype)
+        residual, start, end = _ensure_residual(state, g, pg)
+        if start is None:
+            g = (g + residual).to(g.dtype)
+        else:
+            g[start:end] += residual
 
     g_fp16 = g.half()
     shard_size = g.numel() // world_size

@@ -27,9 +27,11 @@ def build_comm_hook(
     num_bits: int = 8,
     int8_variant: str = "linear",
     error_feedback: bool = False,
+    ef_local: bool = True,
     sparse_comm: bool = True,
     qsgd_s: int = 4,
     qsgd_bucket_size: int = 0,
+    qsgd_low_bit_comm: bool = True,
     topk_k: int = 0,
     topk_ratio: float = 0.01,
     randomk_k: int = 0,
@@ -43,6 +45,8 @@ def build_comm_hook(
     onebit_col_size: int = 256,
     onebit_use_cpp: bool = True,
     signsgd_use_delta: bool = False,
+    nc_use_bit_packing: bool = True,
+    nc_use_norm_scale: bool = True,
     **kwargs: Any,
 ) -> Tuple[Optional[Any], Optional[Any]]:
     if name is None:
@@ -55,31 +59,32 @@ def build_comm_hook(
     ef = error_feedback
 
     if n == "int8":
-        return GradQuantState(num_bits=num_bits, error_feedback=ef, variant=int8_variant), fsdp_quantized_comm_hook
+        return GradQuantState(num_bits=num_bits, error_feedback=ef, variant=int8_variant, ef_local=ef_local), fsdp_quantized_comm_hook
     if n == "fp16":
-        return FP16State(error_feedback=ef), fsdp_fp16_comm_hook
+        return FP16State(error_feedback=ef, ef_local=ef_local), fsdp_fp16_comm_hook
     if n == "qsgd":
-        return QSGDState(s=qsgd_s, error_feedback=ef, bucket_size=qsgd_bucket_size), fsdp_qsgd_comm_hook
+        return QSGDState(s=qsgd_s, error_feedback=ef, ef_local=ef_local, bucket_size=qsgd_bucket_size, low_bit_comm=qsgd_low_bit_comm), fsdp_qsgd_comm_hook
     if n == "signsgd" or n == "onebit":
-        return SignSGDState(error_feedback=ef, use_delta_scale=signsgd_use_delta), fsdp_signsgd_comm_hook
+        return SignSGDState(error_feedback=ef, use_delta_scale=signsgd_use_delta, ef_local=ef_local), fsdp_signsgd_comm_hook
     if n == "onebit_seide":
         return OneBitSeideState(
             col_size=onebit_col_size,
             error_feedback=ef,
             use_cpp=onebit_use_cpp,
+            ef_local=ef_local,
         ), fsdp_onebit_seide_comm_hook
     if n == "nc":
-        return NCState(error_feedback=ef), fsdp_nc_comm_hook
+        return NCState(error_feedback=ef, use_bit_packing=nc_use_bit_packing, ef_local=ef_local, use_norm_scale=nc_use_norm_scale), fsdp_nc_comm_hook
     if n == "topk":
-        return TopKState(k=topk_k, ratio=topk_ratio, error_feedback=ef, sparse_comm=sparse_comm), fsdp_topk_comm_hook
+        return TopKState(k=topk_k, ratio=topk_ratio, error_feedback=ef, sparse_comm=sparse_comm, ef_local=ef_local), fsdp_topk_comm_hook
     if n == "randomk":
-        return RandomKState(k=randomk_k, ratio=randomk_ratio, error_feedback=ef, sparse_comm=sparse_comm), fsdp_randomk_comm_hook
+        return RandomKState(k=randomk_k, ratio=randomk_ratio, error_feedback=ef, sparse_comm=sparse_comm, ef_local=ef_local), fsdp_randomk_comm_hook
     if n == "thresholdv":
-        return ThresholdVState(v=threshold_v, v_neg=threshold_v_neg, ratio=threshold_ratio, error_feedback=ef, sparse_comm=sparse_comm), fsdp_thresholdv_comm_hook
+        return ThresholdVState(v=threshold_v, v_neg=threshold_v_neg, ratio=threshold_ratio, error_feedback=ef, sparse_comm=sparse_comm, ef_local=ef_local), fsdp_thresholdv_comm_hook
     if n == "sketch":
-        return SketchState(k=sketch_k, ratio=sketch_ratio, error_feedback=ef, two_round=sketch_two_round), fsdp_sketch_comm_hook
+        return SketchState(k=sketch_k, ratio=sketch_ratio, error_feedback=ef, two_round=sketch_two_round, ef_local=ef_local), fsdp_sketch_comm_hook
     if n == "hybrid_topk_int8" or n == "topk_int8":
-        return HybridTopKInt8State(k=topk_k, ratio=topk_ratio, error_feedback=ef), fsdp_hybrid_topk_int8_comm_hook
+        return HybridTopKInt8State(k=topk_k, ratio=topk_ratio, error_feedback=ef, ef_local=ef_local), fsdp_hybrid_topk_int8_comm_hook
 
     raise ValueError(
         f"Unsupported comm hook: {name}. "

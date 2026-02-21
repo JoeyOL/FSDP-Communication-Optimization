@@ -147,9 +147,10 @@ def _onebit_seide_reconstruct_from_gathered(
 
 
 class OneBitSeideState:
-    def __init__(self, col_size: int = 256, error_feedback: bool = True, use_cpp: bool = True) -> None:
+    def __init__(self, col_size: int = 256, error_feedback: bool = True, use_cpp: bool = True, ef_local: bool = False) -> None:
         self.col_size = col_size
         self.error_feedback = error_feedback
+        self._ef_local = ef_local
         # 是否尝试使用 C++/CUDA 扩展实现 1-bit Seide（如果可用）
         self.use_cpp = use_cpp
 

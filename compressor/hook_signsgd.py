@@ -5,8 +5,9 @@ from .common import _apply_error_feedback, _ensure_residual
 
 
 class SignSGDState:
-    def __init__(self, error_feedback: bool = True, use_delta_scale: bool = False) -> None:
+    def __init__(self, error_feedback: bool = True, use_delta_scale: bool = False, ef_local: bool = False) -> None:
         self.error_feedback = error_feedback
+        self._ef_local = ef_local
         # use_delta_scale: True = paper "x - δ·sign(g)": output direction only (scale=1), δ from optimizer lr
         self.use_delta_scale = use_delta_scale
 
@@ -26,8 +27,11 @@ def fsdp_signsgd_comm_hook(
 
     g = full_flat_grad.contiguous().view(-1)
     if state.error_feedback:
-        residual = _ensure_residual(state, g)
-        g = (g + residual).to(g.dtype)
+        residual, start, end = _ensure_residual(state, g, pg)
+        if start is None:
+            g = (g + residual).to(g.dtype)
+        else:
+            g[start:end] += residual
 
     sign_g = g.sign()
     shard_size = g.numel() // world_size

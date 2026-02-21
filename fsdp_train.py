@@ -103,6 +103,12 @@ def main():
         help='是否启用误差反馈（与量化/稀疏化结合）',
     )
     parser.add_argument(
+        '--comm-ef-local',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='误差反馈使用本地模式（默认开）：仅对本 rank 的 shard 做残差，不 AllGather；--no-comm-ef-local 关闭',
+    )
+    parser.add_argument(
         '--comm-sparse-comm',
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -110,6 +116,24 @@ def main():
     )
     parser.add_argument('--comm-qsgd-s', type=int, default=4, help='QSGD 量化水平数 s')
     parser.add_argument('--comm-qsgd-bucket-size', type=int, default=0, help='QSGD 桶大小（0=整向量一桶，如512按桶独立scale）')
+    parser.add_argument(
+        '--comm-qsgd-low-bit',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='QSGD 是否用低比特 all_to_all（默认开）。关掉则用 float16 reduce_scatter，数据量减半，通常能缩短通信时间',
+    )
+    parser.add_argument(
+        '--comm-nc-bit-packing',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Natural Compression 是否用 9 比特打包通信（默认开），约 3.5× 通信量下降；关掉则 reduce_scatter(float32)',
+    )
+    parser.add_argument(
+        '--comm-nc-norm-scale',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='NC 是否先按 L2 范数缩放再量化（默认开），可明显改善 loss；--no-comm-nc-norm-scale 关闭',
+    )
     parser.add_argument('--comm-topk-ratio', type=float, default=0.01, help='Top-k/Random-k/Threshold 稀疏比例（k=ratio*numel）')
     parser.add_argument('--comm-threshold-v', type=float, default=0.0, help='Threshold-v 正侧阈值 v_pos（0 则用 ratio 分位数）')
     parser.add_argument('--comm-threshold-v-neg', type=float, default=None, help='Threshold-v 负侧阈值 v_neg（缺省与 v 对称）')
@@ -174,10 +198,14 @@ def main():
     comm_state, comm_hook = build_comm_hook(
         args.comm_hook,
         error_feedback=getattr(args, 'comm_error_feedback', False),
+        ef_local=getattr(args, 'comm_ef_local', True),
         int8_variant=getattr(args, 'comm_int8_variant', 'linear'),
         sparse_comm=getattr(args, 'comm_sparse_comm', True),
         qsgd_s=getattr(args, 'comm_qsgd_s', 4),
         qsgd_bucket_size=getattr(args, 'comm_qsgd_bucket_size', 0),
+        qsgd_low_bit_comm=getattr(args, 'comm_qsgd_low_bit', True),
+        nc_use_bit_packing=getattr(args, 'comm_nc_bit_packing', True),
+        nc_use_norm_scale=getattr(args, 'comm_nc_norm_scale', True),
         topk_ratio=getattr(args, 'comm_topk_ratio', 0.01),
         randomk_ratio=getattr(args, 'comm_topk_ratio', 0.01),
         threshold_ratio=getattr(args, 'comm_topk_ratio', 0.01),
@@ -194,8 +222,13 @@ def main():
         model.register_comm_hook(comm_state, comm_hook)
         logger.info("✅ 通信压缩 hook 注册成功")
     
-    logger.info(f"✅ Rank {rank} 模型加载完成，参数数量: {sum(p.numel() for p in model.parameters()):,}")
-    
+    total_param_numel = sum(p.numel() for p in model.parameters())
+    logger.info(f"✅ Rank {rank} 模型加载完成，参数数量: {total_param_numel:,}")
+    if rank == 0:
+        log_dir = Path(args.output_dir) / "logs" / getattr(args, "run_name", "run")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "param_numel.txt").write_text(str(total_param_numel), encoding="utf-8")
+
     # 创建输出目录
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     

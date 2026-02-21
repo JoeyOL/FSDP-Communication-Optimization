@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -14,6 +15,61 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from perf.trace_overlap import compute_comm_compute_overlap_from_trace
+
+
+def _compute_comm_total_bytes_per_step_per_rank(
+    param_numel: int,
+    world_size: int,
+    comm_hook: str,
+    error_feedback: bool,
+    ef_local: bool,
+    nc_bit_packing: bool = True,
+) -> Optional[int]:
+    """Estimate total communication bytes sent per rank per step (one backward).
+
+    Uses same conventions as comm_usage.md: reduce_scatter + all_gather (if EF and not ef_local).
+    Returns None if hook type is not handled.
+    """
+    if world_size < 1:
+        world_size = 1
+    n = param_numel
+    w = world_size
+    ef_ag = error_feedback and not ef_local  # extra all_gather for full EF
+
+    hook = (comm_hook or "none").lower().strip()
+    if hook == "none":
+        rs = n * 4  # float32
+        ag = (n * 4) if ef_ag else 0
+        return rs + ag
+    if hook == "fp16":
+        rs = n * 2
+        ag = (n * 2) if ef_ag else 0
+        return rs + ag
+    if hook == "int8":
+        rs = n * 1
+        ag = (n * 1) if ef_ag else 0
+        return rs + ag
+    if hook in ("qsgd", "signsgd", "onebit"):
+        # reduce_scatter in float16 or low-bit; all_gather same if EF
+        rs = n * 2
+        ag = (n * 2) if ef_ag else 0
+        return rs + ag
+    if hook == "nc":
+        if nc_bit_packing:
+            # all_to_all: each rank sends W shards of ceil(shard_el/8)*9 bytes
+            shard_el = n // w
+            packed_per_shard = math.ceil(shard_el / 8) * 9
+            rs = w * packed_per_shard
+        else:
+            rs = n * 4  # float32 reduce_scatter
+        ag = (n * 4) if ef_ag else 0
+        return rs + ag
+    if hook in ("topk", "randomk", "thresholdv", "sketch", "hybrid_topk_int8", "onebit_seide"):
+        # Approximate: sparse/compressed; use baseline as upper bound
+        rs = n * 4
+        ag = (n * 4) if ef_ag else 0
+        return rs + ag
+    return None
 
 
 _COMM_NAME_KEYWORDS = (
@@ -293,6 +349,12 @@ def main() -> None:
         action="store_true",
         help="Write legacy names: summary_rank0.json + comm_op_summary_rank0.csv (trace-derived).",
     )
+    ap.add_argument(
+        "--param_numel",
+        type=int,
+        default=None,
+        help="Total model param count (for comm_total_bytes when param_numel.txt missing, e.g. old runs).",
+    )
     args = ap.parse_args()
 
     trace_path = Path(args.trace_path)
@@ -316,6 +378,38 @@ def main() -> None:
         },
         "scopes": scopes,
     }
+
+    # 通信总字节数（每 step 每 rank 发送量）：从 log_dir 的 config.json + param_numel.txt（或 --param_numel）推算
+    log_dir = out_dir.parent
+    config_path = log_dir / "config.json"
+    param_path = log_dir / "param_numel.txt"
+    param_numel_val: Optional[int] = None
+    if args.param_numel is not None and args.param_numel > 0:
+        param_numel_val = args.param_numel
+    elif param_path.exists():
+        try:
+            param_numel_val = int(param_path.read_text(encoding="utf-8").strip())
+        except Exception:
+            pass
+    if config_path.exists() and param_numel_val is not None:
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            world_size = int(config.get("nproc", 1)) or 1
+            comm_hook = config.get("comm_hook", "none") or "none"
+            error_feedback = config.get("comm_error_feedback", False) is True
+            ef_local = config.get("comm_ef_local", True) is True
+            nc_bit_packing = config.get("comm_nc_bit_packing", True) is True
+            total_bytes = _compute_comm_total_bytes_per_step_per_rank(
+                param_numel_val, world_size, comm_hook, error_feedback, ef_local, nc_bit_packing
+            )
+            if total_bytes is not None:
+                payload["comm_total_bytes_per_step_per_rank"] = total_bytes
+                payload["comm_total_bytes_note"] = (
+                    "estimated from param_numel + config (comm_hook, error_feedback, ef_local); "
+                    "per step, per rank send volume."
+                )
+        except Exception:
+            pass
 
     if args.compat_rank0_names:
         json_name = "summary_rank0.json"

@@ -51,10 +51,11 @@ def _heavymix_topk_indices(sketch: torch.Tensor, d: int, width: int, depth: int,
 
 
 class SketchState:
-    def __init__(self, k: int = 0, ratio: float = 0.01, error_feedback: bool = True, two_round: bool = False) -> None:
+    def __init__(self, k: int = 0, ratio: float = 0.01, error_feedback: bool = True, two_round: bool = False, ef_local: bool = False) -> None:
         self.k = k
         self.ratio = ratio
         self.error_feedback = error_feedback
+        self._ef_local = ef_local
         self.two_round = two_round
         self._sketch_depth = 3
         self._sketch_width = 0
@@ -90,8 +91,11 @@ def fsdp_sketch_comm_hook(
 
     g = full_flat_grad.contiguous().view(-1)
     if state.error_feedback:
-        residual = _ensure_residual(state, g)
-        g = (g + residual).to(g.dtype)
+        residual, start, end = _ensure_residual(state, g, pg)
+        if start is None:
+            g = (g + residual).to(g.dtype)
+        else:
+            g[start:end] += residual
 
     d = g.numel()
     k = state.k if state.k > 0 else max(1, int(d * state.ratio))
@@ -123,8 +127,12 @@ def fsdp_sketch_comm_hook(
         if state.error_feedback:
             full_reconstructed = torch.zeros_like(g)
             full_reconstructed[topk_indices] = full_sum[topk_indices] / float(world_size)
-            residual = _ensure_residual(state, full_flat_grad)
-            residual.copy_(g - full_reconstructed)
+            residual, start, end = _ensure_residual(state, full_flat_grad, pg)
+            diff = g - full_reconstructed
+            if start is None:
+                residual.copy_(diff)
+            else:
+                residual.copy_(diff[start:end])
         return
 
     sketch = state._count_sketch(g, width, depth)

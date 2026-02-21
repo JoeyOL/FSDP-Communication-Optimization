@@ -7,9 +7,10 @@ from .common import _apply_error_feedback, _ensure_residual
 
 
 class GradQuantState:
-    def __init__(self, num_bits: int = 8, error_feedback: bool = False, variant: str = "linear") -> None:
+    def __init__(self, num_bits: int = 8, error_feedback: bool = False, variant: str = "linear", ef_local: bool = False) -> None:
         self.num_bits = num_bits
         self.error_feedback = error_feedback
+        self._ef_local = ef_local
         # variant: "linear" (symmetric scale=global_max) or "dynamic_tree" (normalize to [0,1], 7-bit stochastic)
         self.variant = (variant or "linear").lower().strip()
 
@@ -63,8 +64,11 @@ def fsdp_quantized_comm_hook(
 
     g = full_flat_grad.contiguous().view(-1)
     if state.error_feedback:
-        residual = _ensure_residual(state, g)
-        g = (g + residual).to(g.dtype)
+        residual, start, end = _ensure_residual(state, g, pg)
+        if start is None:
+            g = (g + residual).to(g.dtype)
+        else:
+            g[start:end] += residual
 
     numel = g.numel()
     assert numel % world_size == 0, (

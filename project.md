@@ -152,7 +152,7 @@ chmod +x scripts/step1_profile.sh
 
 验收要求：
 
-- 训练脚本支持命令行选择压缩算法，例如：`--comm_compress {none,int8,fp16,qsgd,nc,topk,randomk,thresholdv,sketch,gradiveq,signsgd,onebit,...}`（名称可再统一）。
+- 训练脚本支持命令行选择压缩算法，例如：`--comm_compress {none,int8,qsgd,nc,topk,randomk,thresholdv,sketch,gradiveq,onebit,onebit_seide,...}`（名称可再统一）。
 - 压缩模块能在不改训练主逻辑的情况下替换/组合（热插拔）：
   - baseline：不注册 comm hook；
   - 压缩：注册对应 hook，并且保证训练可跑通（至少小数据集/少步数）。
@@ -160,7 +160,7 @@ chmod +x scripts/step1_profile.sh
 中期范围要求：覆盖开题报告中提到的压缩方法（按报告口径归类），至少包括：
 
 - 稀疏化：Top-k、Random-k、threshold-v、Sketched-SGD（sketch 映射）、GradiVeQ（矩阵分解/低秩/向量量化类）。
-- 量化：FP16、8-bit（INT8/FP8 之一先做基线）、1-bit SGD、SignSGD、QSGD、NC（Natural Compression）。
+- 量化：8-bit（INT8 基线，含 linear/dynamic_tree 变体）、1-bit SGD（含 Seide 形式）、QSGD、NC（Natural Compression）。注：本课题不实现 FP16、SignSGD。
 - 误差反馈（Error Feedback）：对量化/稀疏化提供可选残差补偿开关。
 - 混合压缩：至少支持“稀疏化 + 量化”的组合配置（哪种先做、是否对索引/值分别编码）。
 

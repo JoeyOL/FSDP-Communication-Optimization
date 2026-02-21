@@ -76,6 +76,7 @@ GRADIENT_ACCUMULATION_STEPS=1
 MODEL_SIZE="medium"
 COMM_HOOK="none"              # 通信压缩算法名称（none/int8/qsgd/onebit_seide/...）
 COMM_ERROR_FEEDBACK=""        # 非空则启用误差反馈（EF）
+COMM_EF_LOCAL=""              # 空=默认本地 EF；1=显式开 --comm-ef-local；0=显式关 --no-comm-ef-local
 COMM_SPARSE_COMM="yes"        # 非空则使用稀疏通信（indices+values），空则传 full tensor
 COMM_QSGD_S=4                 # QSGD 量化等级 s（如 2/4/8）
 COMM_QSGD_BUCKET_SIZE=0       # QSGD 分桶大小，0 表示整向量一桶
@@ -87,6 +88,7 @@ COMM_ONEBIT_COL_SIZE=256      # 1-bit Seide 的列大小（每列元素数）
 COMM_ONEBIT_USE_CPP=1         # 1 = 默认启用 C++/CUDA 补丁；空 = 关闭（纯 Python 实现）
 COMM_SIGNSGD_USE_DELTA=""     # 非空则 SignSGD 只传方向，由 lr 决定步长
 COMM_SKETCH_TWO_ROUND=""      # 非空则 Sketched-SGD 启用两轮通信 + HEAVYMIX
+COMM_NC_BIT_PACKING=1         # Natural Compression 9 比特打包（非空则启用，约 3.5× 通信量下降）
 
 PASSTHROUGH=()
 
@@ -126,6 +128,10 @@ while [[ $# -gt 0 ]]; do
       COMM_HOOK="$2"; shift 2 ;;
     --comm_error_feedback)
       COMM_ERROR_FEEDBACK=1; shift 1 ;;
+    --comm_ef_local)
+      COMM_EF_LOCAL=1; shift 1 ;;
+    --no_comm_ef_local)
+      COMM_EF_LOCAL=0; shift 1 ;;
     --no_comm_sparse_comm)
       COMM_SPARSE_COMM=""; shift 1 ;;
     --comm_qsgd_s)
@@ -148,6 +154,8 @@ while [[ $# -gt 0 ]]; do
       COMM_SIGNSGD_USE_DELTA=1; shift 1 ;;
     --comm_sketch_two_round)
       COMM_SKETCH_TWO_ROUND=1; shift 1 ;;
+    --no_comm_nc_bit_packing)
+      COMM_NC_BIT_PACKING=""; shift 1 ;;
     --)
       shift
       PASSTHROUGH+=("$@")
@@ -194,6 +202,7 @@ cat > "$LOG_DIR/config.json" << EOF
   "nnodes": ${NNODES},
   "comm_hook": "${COMM_HOOK}",
   "comm_error_feedback": $([ -n "$COMM_ERROR_FEEDBACK" ] && echo true || echo false),
+  "comm_ef_local": $([ "$COMM_EF_LOCAL" = "0" ] && echo false || echo true),
   "comm_sparse_comm": $([ -n "$COMM_SPARSE_COMM" ] && echo true || echo false),
   "comm_qsgd_s": ${COMM_QSGD_S},
   "comm_qsgd_bucket_size": ${COMM_QSGD_BUCKET_SIZE},
@@ -201,6 +210,7 @@ cat > "$LOG_DIR/config.json" << EOF
   "comm_int8_variant": "${COMM_INT8_VARIANT}",
   "comm_onebit_col_size": ${COMM_ONEBIT_COL_SIZE},
   "comm_onebit_use_cpp": $([ -n "$COMM_ONEBIT_USE_CPP" ] && echo true || echo false),
+  "comm_nc_bit_packing": $([ -n "$COMM_NC_BIT_PACKING" ] && echo true || echo false),
   "timestamp": "$(date -Iseconds)"
 }
 EOF
@@ -209,6 +219,8 @@ echo "[CONFIG] Saved config to ${LOG_DIR}/config.json"
 # 压缩相关参数（透传到 fsdp_train.py）
 COMM_EXTRA=()
 [[ -n "$COMM_ERROR_FEEDBACK" ]] && COMM_EXTRA+=(--comm-error-feedback)
+[[ "$COMM_EF_LOCAL" = "1" ]] && COMM_EXTRA+=(--comm-ef-local)
+[[ "$COMM_EF_LOCAL" = "0" ]] && COMM_EXTRA+=(--no-comm-ef-local)
 [[ -n "$COMM_SPARSE_COMM" ]] && COMM_EXTRA+=(--comm-sparse-comm) || COMM_EXTRA+=(--no-comm-sparse-comm)
 COMM_EXTRA+=(--comm-qsgd-s "$COMM_QSGD_S" --comm-qsgd-bucket-size "$COMM_QSGD_BUCKET_SIZE")
 COMM_EXTRA+=(--comm-topk-ratio "$COMM_TOPK_RATIO" --comm-int8-variant "$COMM_INT8_VARIANT")
@@ -218,6 +230,7 @@ COMM_EXTRA+=(--comm-onebit-col-size "$COMM_ONEBIT_COL_SIZE")
 [[ -n "$COMM_THRESHOLD_V_NEG" ]] && COMM_EXTRA+=(--comm-threshold-v-neg "$COMM_THRESHOLD_V_NEG")
 [[ -n "$COMM_SIGNSGD_USE_DELTA" ]] && COMM_EXTRA+=(--comm-signsgd-use-delta)
 [[ -n "$COMM_SKETCH_TWO_ROUND" ]] && COMM_EXTRA+=(--comm-sketch-two-round)
+[[ -n "$COMM_NC_BIT_PACKING" ]] && COMM_EXTRA+=(--comm-nc-bit-packing) || COMM_EXTRA+=(--no-comm-nc-bit-packing)
 
 # NOTE: torchrun expects the training script/module directly (e.g. fsdp_train.py),
 # not a nested "python fsdp_train.py" command.

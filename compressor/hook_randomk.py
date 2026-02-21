@@ -11,10 +11,12 @@ class RandomKState:
         ratio: float = 0.01,
         error_feedback: bool = True,
         sparse_comm: bool = True,
+        ef_local: bool = False,
     ) -> None:
         self.k = k
         self.ratio = ratio
         self.error_feedback = error_feedback
+        self._ef_local = ef_local
         self.sparse_comm = sparse_comm
 
 
@@ -33,8 +35,11 @@ def fsdp_randomk_comm_hook(
 
     g = full_flat_grad.contiguous().view(-1)
     if state.error_feedback:
-        residual = _ensure_residual(state, g)
-        g = (g + residual).to(g.dtype)
+        residual, start, end = _ensure_residual(state, g, pg)
+        if start is None:
+            g = (g + residual).to(g.dtype)
+        else:
+            g[start:end] += residual
 
     numel = g.numel()
     k = state.k if state.k > 0 else max(1, int(numel * state.ratio))
