@@ -87,7 +87,8 @@ def fsdp_thresholdv_comm_hook(
         v_neg = state.v_neg_val
     else:
         abs_g = g.abs()
-        idx = max(1, numel - min(k, numel))
+        # kthvalue returns k-th smallest; k-th largest = (numel - k + 1)-th smallest
+        idx = max(1, min(numel, numel - k + 1))
         v_pos = v_neg = torch.kthvalue(abs_g, idx).values.item()
 
     if state.sparse_comm:

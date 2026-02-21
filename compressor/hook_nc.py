@@ -162,7 +162,8 @@ def fsdp_nc_comm_hook(
             g[start:end] += residual
 
     scale = 1.0
-    g_for_ef = g  # 用于 EF 的梯度（缩放前），与 shard_out 同空间
+    # EF 必须用原始空间的 g：shard_out 最终是 (decoded/world_size)/scale，也在原始空间，故 residual = g_for_ef - reconstructed 一致
+    g_for_ef = g
     if getattr(state, "use_norm_scale", True):
         # 范数缩放：在归一化空间量化，避免小分量被舍入为 0，改善 loss
         norm_sq = (g * g).sum().to(torch.float32)

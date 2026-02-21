@@ -125,14 +125,20 @@ def fsdp_sketch_comm_hook(
         deq_avg = (full_sum[shard_start:shard_end] / float(world_size)).to(full_flat_grad.dtype)
         shard_out.copy_(deq_avg)
         if state.error_feedback:
+            # 不要再次调用 _ensure_residual：本参数已在上面调用过一次，再调会多占槽位导致后续参数错位
             full_reconstructed = torch.zeros_like(g)
             full_reconstructed[topk_indices] = full_sum[topk_indices] / float(world_size)
-            residual, start, end = _ensure_residual(state, full_flat_grad, pg)
             diff = g - full_reconstructed
-            if start is None:
-                residual.copy_(diff)
-            else:
-                residual.copy_(diff[start:end])
+            idx = getattr(state, "_ef_index", 1) - 1
+            if idx >= 0 and getattr(state, "_ef_residual_list", None) and idx < len(state._ef_residual_list):
+                residual = state._ef_residual_list[idx]
+                if getattr(state, "_ef_local", False):
+                    start = getattr(state, "_ef_shard_start", 0)
+                    end = getattr(state, "_ef_shard_end", 0)
+                    if residual.numel() == (end - start) and end <= diff.numel():
+                        residual.copy_(diff[start:end])
+                elif residual.numel() == diff.numel():
+                    residual.copy_(diff)
         return
 
     sketch = state._count_sketch(g, width, depth)
