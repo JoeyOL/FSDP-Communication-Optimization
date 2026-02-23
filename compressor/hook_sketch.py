@@ -206,6 +206,17 @@ def fsdp_sketch_comm_hook(
                 elif residual.numel() == diff.numel():
                     residual.copy_(diff)
 
+        # 通信字节统计（两轮）：
+        # Round1: all_reduce(sketch_flat)，payload 大小约 depth * width * sizeof(float)
+        # Round2: all_gather(values_at_topk)，payload 大小约 k * sizeof(float)
+        try:
+            elem_size = g.element_size()
+            round1_bytes = depth * width * elem_size
+            round2_bytes = k * elem_size
+            _comm_add_bytes(state, round1_bytes + round2_bytes)
+        except Exception:
+            pass
+
         if do_log and g.device.type == "cuda":
             ev_end.record()
             torch.cuda.synchronize(g.device)

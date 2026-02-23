@@ -61,5 +61,10 @@ def snapshot() -> List[Dict[str, int]]:
     ]
 
 
-__all__ = ["CommStats", "attach_to_state", "add_bytes", "reset_step", "snapshot"]
+def total_bytes() -> int:
+    """Return total bytes across all registered stats (sum over hooks)."""
+    return sum(int(stats.bytes_total) for stats in _ALL_STATS)
+
+
+__all__ = ["CommStats", "attach_to_state", "add_bytes", "reset_step", "snapshot", "total_bytes"]
 

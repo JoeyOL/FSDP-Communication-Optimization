@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import torch
 from logger import logger
 from tqdm import tqdm
@@ -12,6 +15,7 @@ from perf.comm_profiler import (
     step_begin,
     step_end,
 )
+from perf.comm_stats import snapshot as comm_snapshot, total_bytes as comm_total_bytes
 
 
 # --- 新增带监控的训练函数 ---
@@ -35,6 +39,8 @@ def train_epoch_with_monitoring(model, dataloader, optimizer, scheduler, epoch, 
     # 使用 disable 参数，确保只有 rank0 打印进度条
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=(rank != 0), dynamic_ncols=True)
     
+    step_count = 0
+
     for batch_idx, batch in enumerate(progress_bar):
         # epoch 传入为 1-based，这里换算为 0-based 以保证 max_steps 计数准确
         global_step = (epoch - 1) * num_batches + batch_idx
@@ -91,6 +97,7 @@ def train_epoch_with_monitoring(model, dataloader, optimizer, scheduler, epoch, 
 
         # 让 profiler schedule 前进 + （可选）采集 step wall time
         step_end(monitor, args, step_t0)
+        step_count += 1
 
         # --- 可选：短跑，用于耗时取证 ---
         if should_stop_early(args, global_step):
@@ -116,6 +123,35 @@ def train_epoch_with_monitoring(model, dataloader, optimizer, scheduler, epoch, 
     dist.barrier()  # 确保所有进程都完成
 
     avg_loss = total_loss / num_batches
+
+    # 在 rank0 上将轻量通信统计写入 log_dir，供 tools/compute_trace_stats.py 使用。
+    if rank == 0:
+        try:
+            hooks = comm_snapshot()
+            total_bytes = int(comm_total_bytes())
+            effective_steps = max(1, step_count)
+            bytes_per_step = int(total_bytes / effective_steps)
+            log_dir = Path(getattr(args, "output_dir", "/root/llama-7b/fsdp_output")) / "logs" / getattr(
+                args, "run_name", "run"
+            )
+            log_dir.mkdir(parents=True, exist_ok=True)
+            out = {
+                "step_count": effective_steps,
+                "total_bytes_per_rank": total_bytes,
+                "bytes_per_step_per_rank": bytes_per_step,
+                "by_hook": hooks,
+            }
+            (log_dir / "comm_stats_rank0.json").write_text(
+                json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            logger.info(
+                "[comm_stats] wrote runtime comm stats to %s (bytes_per_step_per_rank=%s)",
+                log_dir / "comm_stats_rank0.json",
+                bytes_per_step,
+            )
+        except Exception as e:
+            logger.warning(f"[comm_stats] failed to write runtime comm stats: {e}")
+
     return avg_loss
     
 

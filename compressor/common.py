@@ -165,10 +165,6 @@ def _sparse_all_gather_and_merge(
         dist.all_gather_into_tensor(values_buf, values_flat, group=group)
         indices_all = indices_buf.view(world_size, k)
         values_all = values_buf.view(world_size, k)
-        approx_bytes = (
-            indices_buf.numel() * indices_buf.element_size()
-            + values_buf.numel() * values_buf.element_size()
-        )
     else:
         indices_list = [torch.empty(k, device=device, dtype=indices.dtype) for _ in range(world_size)]
         values_list = [torch.empty(k, device=device, dtype=dtype) for _ in range(world_size)]
@@ -176,13 +172,11 @@ def _sparse_all_gather_and_merge(
         dist.all_gather(values_list, values_flat, group=group)
         indices_all = torch.stack(indices_list, dim=0)
         values_all = torch.stack(values_list, dim=0)
-        approx_bytes = (
-            indices_all.numel() * indices_all.element_size()
-            + values_all.numel() * values_all.element_size()
-        )
-
+    # 通信字节统计采用“每 rank 发送的 payload”为基准：
+    # k 个 indices（int64）+ k 个 values（与梯度同 dtype），与 tools/compute_trace_stats.py 中的公式保持一致。
     try:
-        _comm_add_bytes(state, approx_bytes)
+        per_rank_bytes = k * (indices.element_size() + values.element_size())
+        _comm_add_bytes(state, per_rank_bytes)
     except Exception:
         pass
 

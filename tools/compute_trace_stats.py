@@ -388,44 +388,62 @@ def main() -> None:
     comm_bytes_note: Optional[str] = None
 
     log_dir = out_dir.parent
-    config_path = log_dir / "config.json"
-    param_path = log_dir / "param_numel.txt"
-    param_numel_val: Optional[int] = None
-    if args.param_numel is not None and args.param_numel > 0:
-        param_numel_val = args.param_numel
-    elif param_path.exists():
+
+    # 1) 优先使用运行时轻量通信统计器写出的 comm_stats_rank0.json
+    comm_stats_path = log_dir / "comm_stats_rank0.json"
+    if comm_stats_path.exists():
         try:
-            param_numel_val = int(param_path.read_text(encoding="utf-8").strip())
-        except Exception:
-            pass
-    if config_path.exists() and param_numel_val is not None:
-        try:
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-            world_size = int(config.get("nproc", 1)) or 1
-            comm_hook = config.get("comm_hook", "none") or "none"
-            error_feedback = config.get("comm_error_feedback", False) is True
-            ef_local = config.get("comm_ef_local", True) is True
-            nc_bit_packing = config.get("comm_nc_bit_packing", True) is True
-            sparse_comm = config.get("comm_sparse_comm", True) is True
-            ratio_val = float(config.get("comm_topk_ratio", 0.01) or 0.01)
-            total_bytes = _compute_comm_total_bytes_per_step_per_rank(
-                param_numel_val,
-                world_size,
-                comm_hook,
-                error_feedback,
-                ef_local,
-                nc_bit_packing,
-                sparse_comm,
-                ratio_val,
-            )
-            if total_bytes is not None:
-                comm_bytes = total_bytes
+            cs = json.loads(comm_stats_path.read_text(encoding="utf-8"))
+            b = cs.get("bytes_per_step_per_rank", None)
+            if isinstance(b, (int, float)) and b > 0:
+                comm_bytes = int(b)
                 comm_bytes_note = (
-                    "estimated from param_numel + config (comm_hook, error_feedback, ef_local); "
+                    "from runtime perf.comm_stats (sum over all comm hooks); "
                     "per step, per rank send volume."
                 )
         except Exception:
             pass
+
+    # 2) 若没有 runtime 统计，则回退到基于 config+param_numel 的离线估算
+    if comm_bytes is None:
+        config_path = log_dir / "config.json"
+        param_path = log_dir / "param_numel.txt"
+        param_numel_val: Optional[int] = None
+        if args.param_numel is not None and args.param_numel > 0:
+            param_numel_val = args.param_numel
+        elif param_path.exists():
+            try:
+                param_numel_val = int(param_path.read_text(encoding="utf-8").strip())
+            except Exception:
+                pass
+        if config_path.exists() and param_numel_val is not None:
+            try:
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                world_size = int(config.get("nproc", 1)) or 1
+                comm_hook = config.get("comm_hook", "none") or "none"
+                error_feedback = config.get("comm_error_feedback", False) is True
+                ef_local = config.get("comm_ef_local", True) is True
+                nc_bit_packing = config.get("comm_nc_bit_packing", True) is True
+                sparse_comm = config.get("comm_sparse_comm", True) is True
+                ratio_val = float(config.get("comm_topk_ratio", 0.01) or 0.01)
+                total_bytes = _compute_comm_total_bytes_per_step_per_rank(
+                    param_numel_val,
+                    world_size,
+                    comm_hook,
+                    error_feedback,
+                    ef_local,
+                    nc_bit_packing,
+                    sparse_comm,
+                    ratio_val,
+                )
+                if total_bytes is not None:
+                    comm_bytes = total_bytes
+                    comm_bytes_note = (
+                        "estimated from param_numel + config (comm_hook, error_feedback, ef_local); "
+                        "per step, per rank send volume."
+                    )
+            except Exception:
+                pass
 
     # 构造最终 payload，按“summary 在前、细节在后”的顺序插 key，保证 JSON 顶部优先展示整体指标。
     payload: dict[str, Any] = {}
