@@ -2,6 +2,7 @@ import torch
 import torch.distributed as dist
 
 from .common import _apply_error_feedback, _ensure_residual
+from perf.comm_stats import add_bytes as _comm_add_bytes
 
 
 class FP16State:
@@ -39,6 +40,11 @@ def fsdp_fp16_comm_hook(
     else:
         chunks = list(g_fp16.chunk(world_size, dim=0))
         dist.reduce_scatter(temp_shard, chunks, op=dist.ReduceOp.SUM, group=pg)
+    # 近似统计：按 g_fp16 元素数估算 reduce_scatter 负载
+    try:
+        _comm_add_bytes(state, g_fp16.numel() * g_fp16.element_size())
+    except Exception:
+        pass
 
     deq_avg = (temp_shard.float() / float(world_size)).to(full_flat_grad.dtype)
     shard_out.copy_(deq_avg)

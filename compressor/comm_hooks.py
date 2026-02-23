@@ -5,6 +5,8 @@ Thin registry for FSDP communication hooks.
 
 from typing import Any, Optional, Tuple
 
+from perf.comm_stats import attach_to_state
+
 from .hook_fp16 import FP16State, fsdp_fp16_comm_hook
 from .hook_hybrid_topk_int8 import HybridTopKInt8State, fsdp_hybrid_topk_int8_comm_hook
 from .hook_int8 import GradQuantState, fsdp_quantized_comm_hook
@@ -53,38 +55,63 @@ def build_comm_hook(
         return None, None
 
     n = name.lower().strip()
+    # 兼容脚本中使用的 "threshold_v" 写法
+    if n == "threshold_v":
+        n = "thresholdv"
     if n == "none":
         return None, None
 
     ef = error_feedback
 
     if n == "int8":
-        return GradQuantState(num_bits=num_bits, error_feedback=ef, variant=int8_variant, ef_local=ef_local), fsdp_quantized_comm_hook
+        state = GradQuantState(num_bits=num_bits, error_feedback=ef, variant=int8_variant, ef_local=ef_local)
+        attach_to_state(state, n)
+        return state, fsdp_quantized_comm_hook
     if n == "fp16":
-        return FP16State(error_feedback=ef, ef_local=ef_local), fsdp_fp16_comm_hook
+        state = FP16State(error_feedback=ef, ef_local=ef_local)
+        attach_to_state(state, n)
+        return state, fsdp_fp16_comm_hook
     if n == "qsgd":
-        return QSGDState(s=qsgd_s, error_feedback=ef, ef_local=ef_local, bucket_size=qsgd_bucket_size, low_bit_comm=qsgd_low_bit_comm), fsdp_qsgd_comm_hook
+        state = QSGDState(s=qsgd_s, error_feedback=ef, ef_local=ef_local, bucket_size=qsgd_bucket_size, low_bit_comm=qsgd_low_bit_comm)
+        attach_to_state(state, n)
+        return state, fsdp_qsgd_comm_hook
     if n == "signsgd" or n == "onebit":
-        return SignSGDState(error_feedback=ef, use_delta_scale=signsgd_use_delta, ef_local=ef_local), fsdp_signsgd_comm_hook
+        state = SignSGDState(error_feedback=ef, use_delta_scale=signsgd_use_delta, ef_local=ef_local)
+        attach_to_state(state, n)
+        return state, fsdp_signsgd_comm_hook
     if n == "onebit_seide":
-        return OneBitSeideState(
+        state = OneBitSeideState(
             col_size=onebit_col_size,
             error_feedback=ef,
             use_cpp=onebit_use_cpp,
             ef_local=ef_local,
-        ), fsdp_onebit_seide_comm_hook
+        )
+        attach_to_state(state, n)
+        return state, fsdp_onebit_seide_comm_hook
     if n == "nc":
-        return NCState(error_feedback=ef, use_bit_packing=nc_use_bit_packing, ef_local=ef_local, use_norm_scale=nc_use_norm_scale), fsdp_nc_comm_hook
+        state = NCState(error_feedback=ef, use_bit_packing=nc_use_bit_packing, ef_local=ef_local, use_norm_scale=nc_use_norm_scale)
+        attach_to_state(state, n)
+        return state, fsdp_nc_comm_hook
     if n == "topk":
-        return TopKState(k=topk_k, ratio=topk_ratio, error_feedback=ef, sparse_comm=sparse_comm, ef_local=ef_local), fsdp_topk_comm_hook
+        state = TopKState(k=topk_k, ratio=topk_ratio, error_feedback=ef, sparse_comm=sparse_comm, ef_local=ef_local)
+        attach_to_state(state, n)
+        return state, fsdp_topk_comm_hook
     if n == "randomk":
-        return RandomKState(k=randomk_k, ratio=randomk_ratio, error_feedback=ef, sparse_comm=sparse_comm, ef_local=ef_local), fsdp_randomk_comm_hook
+        state = RandomKState(k=randomk_k, ratio=randomk_ratio, error_feedback=ef, sparse_comm=sparse_comm, ef_local=ef_local)
+        attach_to_state(state, n)
+        return state, fsdp_randomk_comm_hook
     if n == "thresholdv":
-        return ThresholdVState(v=threshold_v, v_neg=threshold_v_neg, ratio=threshold_ratio, error_feedback=ef, sparse_comm=sparse_comm, ef_local=ef_local), fsdp_thresholdv_comm_hook
+        state = ThresholdVState(v=threshold_v, v_neg=threshold_v_neg, ratio=threshold_ratio, error_feedback=ef, sparse_comm=sparse_comm, ef_local=ef_local)
+        attach_to_state(state, n)
+        return state, fsdp_thresholdv_comm_hook
     if n == "sketch":
-        return SketchState(k=sketch_k, ratio=sketch_ratio, error_feedback=ef, two_round=sketch_two_round, ef_local=ef_local), fsdp_sketch_comm_hook
+        state = SketchState(k=sketch_k, ratio=sketch_ratio, error_feedback=ef, two_round=sketch_two_round, ef_local=ef_local)
+        attach_to_state(state, n)
+        return state, fsdp_sketch_comm_hook
     if n == "hybrid_topk_int8" or n == "topk_int8":
-        return HybridTopKInt8State(k=topk_k, ratio=topk_ratio, error_feedback=ef, ef_local=ef_local), fsdp_hybrid_topk_int8_comm_hook
+        state = HybridTopKInt8State(k=topk_k, ratio=topk_ratio, error_feedback=ef, ef_local=ef_local)
+        attach_to_state(state, n)
+        return state, fsdp_hybrid_topk_int8_comm_hook
 
     raise ValueError(
         f"Unsupported comm hook: {name}. "

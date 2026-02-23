@@ -2,6 +2,7 @@ import torch
 import torch.distributed as dist
 
 from .common import _apply_error_feedback, _ensure_residual
+from perf.comm_stats import add_bytes as _comm_add_bytes
 
 
 class SignSGDState:
@@ -41,6 +42,11 @@ def fsdp_signsgd_comm_hook(
     else:
         chunks = list(sign_g.chunk(world_size, dim=0))
         dist.reduce_scatter(temp_shard, chunks, op=dist.ReduceOp.SUM, group=pg)
+    # 近似统计：按 sign_g 元素数估算 reduce_scatter 负载
+    try:
+        _comm_add_bytes(state, sign_g.numel() * sign_g.element_size())
+    except Exception:
+        pass
 
     sign_sum = temp_shard
     if getattr(state, "use_delta_scale", False):

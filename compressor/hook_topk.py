@@ -2,6 +2,7 @@ import torch
 import torch.distributed as dist
 
 from .common import _apply_error_feedback, _ensure_residual, _sparse_all_gather_and_merge
+from perf.comm_stats import add_bytes as _comm_add_bytes
 
 
 class TopKState:
@@ -48,7 +49,7 @@ def fsdp_topk_comm_hook(
     values = g[indices].to(g.dtype)
 
     if state.sparse_comm:
-        full_sum = _sparse_all_gather_and_merge(indices, values, numel, pg)
+        full_sum = _sparse_all_gather_and_merge(state, indices, values, numel, pg)
         shard_size = numel // world_size
         rank = dist.get_rank(pg)
         shard_start = rank * shard_size
@@ -70,6 +71,12 @@ def fsdp_topk_comm_hook(
     else:
         chunks = list(sparse.chunk(world_size, dim=0))
         dist.reduce_scatter(temp_shard, chunks, op=dist.ReduceOp.SUM, group=pg)
+
+    # 近似统计：按输入 sparse 的元素数估算 reduce_scatter 负载
+    try:
+        _comm_add_bytes(state, sparse.numel() * sparse.element_size())
+    except Exception:
+        pass
 
     deq_avg = (temp_shard / float(world_size)).to(full_flat_grad.dtype)
     shard_out.copy_(deq_avg)

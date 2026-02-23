@@ -24,6 +24,8 @@ def _compute_comm_total_bytes_per_step_per_rank(
     error_feedback: bool,
     ef_local: bool,
     nc_bit_packing: bool = True,
+    sparse_comm: bool = True,
+    ratio: float = 0.01,
 ) -> Optional[int]:
     """Estimate total communication bytes sent per rank per step (one backward).
 
@@ -64,8 +66,20 @@ def _compute_comm_total_bytes_per_step_per_rank(
             rs = n * 4  # float32 reduce_scatter
         ag = (n * 4) if ef_ag else 0
         return rs + ag
-    if hook in ("topk", "randomk", "thresholdv", "sketch", "hybrid_topk_int8", "onebit_seide"):
-        # Approximate: sparse/compressed; use baseline as upper bound
+    if hook in ("topk", "randomk", "thresholdv"):
+        # 稀疏通信：仅发送 (indices, values)，每 rank 发送量 ~ k*(sizeof(index)+sizeof(value))
+        if sparse_comm:
+            k = max(1, int(n * max(ratio, 0.0)))
+            # indices:int64=8B, values:fp32=4B
+            main = k * (8 + 4)
+            ag = (n * 4) if ef_ag else 0  # EF 仍然需要一次 full all_gather(shard_out)
+            return main + ag
+        # 稠密通信：补零后走 reduce_scatter，与 baseline 相同
+        rs = n * 4
+        ag = (n * 4) if ef_ag else 0
+        return rs + ag
+    if hook in ("sketch", "hybrid_topk_int8", "onebit_seide"):
+        # 复杂/多轮稀疏通信：暂用 baseline 作为上界近似
         rs = n * 4
         ag = (n * 4) if ef_ag else 0
         return rs + ag
@@ -368,18 +382,11 @@ def main() -> None:
     kernel_summary = _summarize_kernels(trace_path, comm_only=not args.csv_all_kernels)
     scopes = _summarize_scopes(trace_path)
 
-    payload: dict[str, Any] = {
-        "trace_file": str(trace_path.name),
-        "overlap": overlap,
-        "comm_from_trace": {
-            "comm_ratio_kernel_sum": kernel_summary["comm_ratio_kernel_sum"],
-            "comm_kernel_time_ms_sum": kernel_summary["comm_kernel_time_ms_sum"],
-            "total_kernel_time_ms_sum": kernel_summary["total_kernel_time_ms_sum"],
-        },
-        "scopes": scopes,
-    }
+    # 通信总字节数（每 step 每 rank 发送量）：从 log_dir 的 config.json + param_numel.txt（或 --param_numel）推算。
+    # 注意：我们先算好这些 summary 字段，下面按顺序构造 payload，保证它们出现在 JSON 的最前面。
+    comm_bytes: Optional[int] = None
+    comm_bytes_note: Optional[str] = None
 
-    # 通信总字节数（每 step 每 rank 发送量）：从 log_dir 的 config.json + param_numel.txt（或 --param_numel）推算
     log_dir = out_dir.parent
     config_path = log_dir / "config.json"
     param_path = log_dir / "param_numel.txt"
@@ -399,17 +406,47 @@ def main() -> None:
             error_feedback = config.get("comm_error_feedback", False) is True
             ef_local = config.get("comm_ef_local", True) is True
             nc_bit_packing = config.get("comm_nc_bit_packing", True) is True
+            sparse_comm = config.get("comm_sparse_comm", True) is True
+            ratio_val = float(config.get("comm_topk_ratio", 0.01) or 0.01)
             total_bytes = _compute_comm_total_bytes_per_step_per_rank(
-                param_numel_val, world_size, comm_hook, error_feedback, ef_local, nc_bit_packing
+                param_numel_val,
+                world_size,
+                comm_hook,
+                error_feedback,
+                ef_local,
+                nc_bit_packing,
+                sparse_comm,
+                ratio_val,
             )
             if total_bytes is not None:
-                payload["comm_total_bytes_per_step_per_rank"] = total_bytes
-                payload["comm_total_bytes_note"] = (
+                comm_bytes = total_bytes
+                comm_bytes_note = (
                     "estimated from param_numel + config (comm_hook, error_feedback, ef_local); "
                     "per step, per rank send volume."
                 )
         except Exception:
             pass
+
+    # 构造最终 payload，按“summary 在前、细节在后”的顺序插 key，保证 JSON 顶部优先展示整体指标。
+    payload: dict[str, Any] = {}
+    if comm_bytes is not None:
+        payload["comm_total_bytes_per_step_per_rank"] = comm_bytes
+        if comm_bytes_note is not None:
+            payload["comm_total_bytes_note"] = comm_bytes_note
+
+    # overlap/scopes 的 overall 也单独提前一份，便于快速查看整体情况
+    payload["overlap_overall"] = overlap.get("overall", {})
+    payload["scopes_overall"] = scopes.get("overall", {})
+
+    # 其余详细信息随后
+    payload["trace_file"] = str(trace_path.name)
+    payload["overlap"] = overlap
+    payload["comm_from_trace"] = {
+        "comm_ratio_kernel_sum": kernel_summary["comm_ratio_kernel_sum"],
+        "comm_kernel_time_ms_sum": kernel_summary["comm_kernel_time_ms_sum"],
+        "total_kernel_time_ms_sum": kernel_summary["total_kernel_time_ms_sum"],
+    }
+    payload["scopes"] = scopes
 
     if args.compat_rank0_names:
         json_name = "summary_rank0.json"

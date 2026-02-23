@@ -66,8 +66,8 @@ $BASE --comm_hook nc --no_comm_nc_bit_packing
 QSGD 在论文里是「量化 + 编码」两步：量化后不传 float，而是把量化结果编码成比特串（范数 + 级别/符号的打包或 Elias 编码），使每轮通信从 32n 比特降到约 2.8n+32 等，实现约 5.7× 带宽节省。
 
 **本实现**：  
-- **low_bit_comm=True（默认）**：**all_reduce(1 float)** 同步全局 scale + **reduce_scatter(int16)**，与 baseline 同一集体、数据量减半，**不再使用 all_to_all**，利于缩短通信时间。  
-- **low_bit_comm=False**（`--no-comm-qsgd-low-bit`）：**reduce_scatter(float16)**，同样集体、数据量减半。  
+- **low_bit_comm=True（默认）**：对量化后的梯度按桶编码为 bit 串（每桶保存 4 字节范数 + 紧凑的 sign/level），各 rank 之间通过 **all_to_all** 交换编码后的各个 shard，在本地一次性解码并求和得到本 rank 的梯度分片，再除以 $M$。这是更贴近原论文的“位级通信”路径，能在带宽占主导时进一步降低通信比特数，但需要 all_to_all 支持。  
+- **low_bit_comm=False**（`--no-comm-qsgd-low-bit`）：不做 bit 编码，仅在浮点域中以 **reduce_scatter(float16)** 传输量化结果，在保持与 baseline 相同 collective 的前提下将通信字节数压缩为 float32 的一半。  
 建议整向量/按桶均可加 `--comm_error_feedback` 以减轻量化噪声。
 
 整向量 QSGD（s=4）+ 误差反馈（推荐）：
@@ -76,7 +76,7 @@ QSGD 在论文里是「量化 + 编码」两步：量化后不传 float，而是
 $BASE --comm_hook qsgd --comm_qsgd_s 4 --comm_qsgd_bucket_size 0 --comm_error_feedback
 ```
 
-默认已用 **reduce_scatter(int16)** 替代 all_to_all。若需 float16 可关低比特：
+默认使用 **all_to_all + bit 编码** 的低比特路径；若希望仅在浮点域减半通信量且沿用 baseline 的 reduce_scatter 语义，可关闭低比特模式：
 
 ```bash
 $BASE --comm_hook qsgd --comm_qsgd_s 4 --comm_qsgd_bucket_size 0 --no-comm-qsgd-low-bit

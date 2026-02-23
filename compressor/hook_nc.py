@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 
 from .common import _apply_error_feedback, _ensure_residual
+from perf.comm_stats import add_bytes as _comm_add_bytes
 
 # Exponent range for ±2^k: k in [-127, 127], stored as k_stored = k + 128 in [1, 255]. 0 → code 0.
 _K_OFFSET = 128
@@ -187,6 +188,11 @@ def fsdp_nc_comm_hook(
             send_list = list(send_buf.chunk(world_size, dim=0))
             recv_list = list(recv_buf.chunk(world_size, dim=0))
             dist.all_to_all(recv_list, send_list, group=pg)
+        # 近似统计：按 send_buf 元素数估算 all_to_all 负载
+        try:
+            _comm_add_bytes(state, send_buf.numel() * send_buf.element_size())
+        except Exception:
+            pass
         temp_shard = _nc_unpack_all_shards_and_decode(recv_buf, world_size, shard_size, g.dtype, g.device)
     else:
         temp_shard = torch.empty(shard_size, device=g.device, dtype=g.dtype)
@@ -195,6 +201,11 @@ def fsdp_nc_comm_hook(
         else:
             chunks = list(q_g.chunk(world_size, dim=0))
             dist.reduce_scatter(temp_shard, chunks, op=dist.ReduceOp.SUM, group=pg)
+        # 近似统计：按 q_g 元素数估算 reduce_scatter 负载
+        try:
+            _comm_add_bytes(state, q_g.numel() * q_g.element_size())
+        except Exception:
+            pass
 
     deq_avg = (temp_shard / float(world_size)).to(full_flat_grad.dtype)
     if getattr(state, "use_norm_scale", True):

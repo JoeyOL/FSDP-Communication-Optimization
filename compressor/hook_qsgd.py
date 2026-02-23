@@ -3,6 +3,7 @@ import torch
 import torch.distributed as dist
 
 from .common import _apply_error_feedback, _ensure_residual, logger
+from perf.comm_stats import add_bytes as _comm_add_bytes
 
 # Log only first few hook invocations per process to locate hang (each param triggers hook once)
 _QSGD_LOG_CAP = 2
@@ -238,8 +239,8 @@ def fsdp_qsgd_comm_hook(
     numel = full_flat_grad.numel()
     shard_size = numel // world_size
     use_low_bits_whole = (state.bucket_size <= 0 or state.bucket_size >= numel) and (shard_size > 0)
-    use_low_bits_bucketed = (0 < state.bucket_size < numel) and (shard_size > 0)
-    use_low_bits = getattr(state, "low_bit_comm", True) and (use_low_bits_whole or use_low_bits_bucketed)
+    # 对按桶 QSGD，低比特 + bit 编码 + all_to_all 在 Python 实现下开销过大，这里仅在“整向量一桶”时启用低比特路径。
+    use_low_bits = getattr(state, "low_bit_comm", True) and use_low_bits_whole
 
     global _qsgd_hook_log_count
     _qsgd_hook_log_count += 1
@@ -250,11 +251,6 @@ def fsdp_qsgd_comm_hook(
             logger.info(
                 "[QSGD hook] rank=%s whole-vector (low-bit) path numel=%s shard_size=%s ef=%s (call#%s)",
                 rank, numel, shard_size, state.error_feedback, _qsgd_hook_log_count,
-            )
-        elif use_low_bits_bucketed:
-            logger.info(
-                "[QSGD hook] rank=%s bucketed (low-bit) path numel=%s bucket_size=%s shard_size=%s (call#%s)",
-                rank, numel, state.bucket_size, shard_size, _qsgd_hook_log_count,
             )
 
     g = full_flat_grad.contiguous().view(-1)
@@ -276,20 +272,73 @@ def fsdp_qsgd_comm_hook(
         logger.info("[QSGD hook] rank=%s after quantize", rank)
 
     if use_low_bits:
-        # reduce_scatter(quantized fp16) + one all_reduce(scale). NCCL does not support int16; use float16 for same 2-byte comm.
-        norm_val = max(g.norm(p=2).item(), 1e-12)
-        norm_t = torch.tensor([norm_val], device=g.device, dtype=torch.float32)
-        dist.all_reduce(norm_t, op=dist.ReduceOp.MAX, group=pg)
-        global_max_norm = norm_t.item()
-        scale = 32767.0 / (float(world_size) * max(global_max_norm, 1e-12))
-        q_scaled = (q_g * scale).round().clamp(-32767, 32767).to(torch.float16)
-        temp_fp16 = torch.empty(shard_size, device=g.device, dtype=torch.float16)
-        if hasattr(dist, "reduce_scatter_tensor"):
-            dist.reduce_scatter_tensor(temp_fp16, q_scaled, op=dist.ReduceOp.SUM, group=pg)
+        # 低比特通信：按 QSGD 码本编码为 bit 串，并用 all_to_all 交换各 shard 的编码，再在本地解码求和。
+        # 与 reduce_scatter 相比，仍是“整向量编码 + all_to_all”的 bit 通信路径，更贴近原 QSGD 设计。
+        #
+        # 设计：将量化后的 q_g 看作一维向量，按 shard_size 划分为 world_size 个 shard；
+        # 对每个 shard 调用 _qsgd_encode_bucketed_chunk 得到定长字节串，拼接成 send_buf，
+        # 用 all_to_all 交换后逐 shard 调用 _qsgd_decode_bucketed_chunk 解码并求和。
+        if shard_size == 0:
+            temp_shard = torch.zeros(0, device=g.device, dtype=torch.float32)
         else:
-            chunks = list(q_scaled.chunk(world_size, dim=0))
-            dist.reduce_scatter(temp_fp16, chunks, op=dist.ReduceOp.SUM, group=pg)
-        temp_shard = temp_fp16.float() / scale
+            # bucket_size <= 0 或大于 shard_size 时，退化为“整 shard 一桶”，避免除 0
+            eff_bucket_size = state.bucket_size
+            if eff_bucket_size <= 0 or eff_bucket_size > shard_size:
+                eff_bucket_size = shard_size
+
+            # 先对第一个 shard 进行编码以确定每个 shard 的字节长度（各 rank、各 shard 一致）
+            first_start = 0
+            first_end = shard_size
+            first_enc = _qsgd_encode_bucketed_chunk(
+                g[first_start:first_end],
+                q_g[first_start:first_end],
+                eff_bucket_size,
+                state.s,
+            )
+            shard_bytes = first_enc.numel()
+            send_buf = torch.empty(world_size * shard_bytes, device=g.device, dtype=torch.uint8)
+            # 填充第一个 shard
+            send_buf[0:shard_bytes].copy_(first_enc)
+            # 编码其余 shard
+            for j in range(1, world_size):
+                start = j * shard_size
+                end = start + shard_size
+                enc = _qsgd_encode_bucketed_chunk(
+                    g[start:end],
+                    q_g[start:end],
+                    eff_bucket_size,
+                    state.s,
+                )
+                # 理论上各 shard 的编码长度应一致；如不一致则截断/填充为相同长度
+                buf_j = send_buf[j * shard_bytes : (j + 1) * shard_bytes]
+                buf_j.zero_()
+                buf_j[: enc.numel()].copy_(enc)
+
+            recv_buf = torch.empty_like(send_buf)
+            if hasattr(dist, "all_to_all_single"):
+                dist.all_to_all_single(recv_buf, send_buf, group=pg)
+            else:
+                send_chunks = list(send_buf.chunk(world_size, dim=0))
+                recv_chunks = [torch.empty_like(send_chunks[0]) for _ in range(world_size)]
+                dist.all_to_all(recv_chunks, send_chunks, group=pg)
+                recv_buf = torch.cat(recv_chunks, dim=0)
+
+            # 近似统计：按 send_buf 元素数估算 all_to_all 负载
+            try:
+                _comm_add_bytes(state, send_buf.numel() * send_buf.element_size())
+            except Exception:
+                pass
+
+            temp_shard = torch.zeros(shard_size, device=g.device, dtype=torch.float32)
+            for j in range(world_size):
+                buf_j = recv_buf[j * shard_bytes : (j + 1) * shard_bytes]
+                decoded = _qsgd_decode_bucketed_chunk(
+                    buf_j,
+                    state.s,
+                    shard_size,
+                    eff_bucket_size,
+                )
+                temp_shard.add_(decoded)
     else:
         # Float path: same collective as baseline. Use float16 reduce_scatter to cut comm volume in half (saves time when bandwidth-bound).
         q_g_fp16 = q_g.half()
@@ -299,6 +348,11 @@ def fsdp_qsgd_comm_hook(
         else:
             chunks = list(q_g_fp16.chunk(world_size, dim=0))
             dist.reduce_scatter(temp_shard_fp16, chunks, op=dist.ReduceOp.SUM, group=pg)
+        # 近似统计：按 q_g_fp16 元素数估算 reduce_scatter 负载
+        try:
+            _comm_add_bytes(state, q_g_fp16.numel() * q_g_fp16.element_size())
+        except Exception:
+            pass
         temp_shard = temp_shard_fp16.float()
 
     deq_avg = (temp_shard / float(world_size)).to(full_flat_grad.dtype)

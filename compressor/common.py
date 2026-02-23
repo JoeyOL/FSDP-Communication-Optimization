@@ -8,6 +8,8 @@ from typing import Any, Optional
 import torch
 import torch.distributed as dist
 
+from perf.comm_stats import add_bytes as _comm_add_bytes
+
 try:
     from logger import logger  # 项目里的统一 logger
 except ImportError:  # 直接跑单文件时的兜底
@@ -69,7 +71,11 @@ def _ensure_residual(
 
 _all_gather_shard_log_count = 0
 
-def _all_gather_shard(shard: torch.Tensor, group: Optional[dist.ProcessGroup] = None) -> torch.Tensor:
+def _all_gather_shard(
+    state: Any,
+    shard: torch.Tensor,
+    group: Optional[dist.ProcessGroup] = None,
+) -> torch.Tensor:
     """All-gather shard from all ranks into full tensor."""
     global _all_gather_shard_log_count
     if group is None:
@@ -88,6 +94,11 @@ def _all_gather_shard(shard: torch.Tensor, group: Optional[dist.ProcessGroup] = 
     else:
         chunks = list(full.chunk(world_size, dim=0))
         dist.all_gather(chunks, shard, group=group)
+    # 近似统计：每个 rank 获得 full.numel() 元素作为 all_gather 负载
+    try:
+        _comm_add_bytes(state, full.numel() * full.element_size())
+    except Exception:
+        pass
     if do_log:
         logger.info("[common] rank=%s _all_gather_shard after collective", r)
     return full
@@ -113,12 +124,13 @@ def _apply_error_feedback(
         if residual.numel() == shard_out.numel() and end <= to_compress.numel():
             residual.copy_(to_compress[start:end] - shard_out)
         return
-    full_reconstructed = _all_gather_shard(shard_out, group=group)
+    full_reconstructed = _all_gather_shard(state, shard_out, group=group)
     if residual.numel() == to_compress.numel():
         residual.copy_(to_compress - full_reconstructed)
 
 
 def _sparse_all_gather_and_merge(
+    state: Any,
     indices: torch.Tensor,
     values: torch.Tensor,
     numel: int,
@@ -138,6 +150,14 @@ def _sparse_all_gather_and_merge(
     indices_flat = indices.contiguous().view(-1)
     values_flat = values.contiguous().view(-1)
 
+    debug = bool(getattr(state, "_debug_sparse_allgather_timing", False))
+    use_cuda_timer = debug and device.type == "cuda"
+    if use_cuda_timer:
+        ev0 = torch.cuda.Event(enable_timing=True)
+        ev1 = torch.cuda.Event(enable_timing=True)
+        ev2 = torch.cuda.Event(enable_timing=True)
+        ev0.record()
+
     if hasattr(dist, "all_gather_into_tensor"):
         indices_buf = torch.empty(world_size * k, device=device, dtype=indices.dtype)
         values_buf = torch.empty(world_size * k, device=device, dtype=dtype)
@@ -145,6 +165,10 @@ def _sparse_all_gather_and_merge(
         dist.all_gather_into_tensor(values_buf, values_flat, group=group)
         indices_all = indices_buf.view(world_size, k)
         values_all = values_buf.view(world_size, k)
+        approx_bytes = (
+            indices_buf.numel() * indices_buf.element_size()
+            + values_buf.numel() * values_buf.element_size()
+        )
     else:
         indices_list = [torch.empty(k, device=device, dtype=indices.dtype) for _ in range(world_size)]
         values_list = [torch.empty(k, device=device, dtype=dtype) for _ in range(world_size)]
@@ -152,12 +176,38 @@ def _sparse_all_gather_and_merge(
         dist.all_gather(values_list, values_flat, group=group)
         indices_all = torch.stack(indices_list, dim=0)
         values_all = torch.stack(values_list, dim=0)
+        approx_bytes = (
+            indices_all.numel() * indices_all.element_size()
+            + values_all.numel() * values_all.element_size()
+        )
+
+    try:
+        _comm_add_bytes(state, approx_bytes)
+    except Exception:
+        pass
+
+    if use_cuda_timer:
+        ev1.record()
 
     full = torch.zeros(numel, device=device, dtype=dtype)
     for r in range(world_size):
         idx = indices_all[r].long()
         val = values_all[r]
         full.index_add_(0, idx, val)
+
+    if use_cuda_timer:
+        ev2.record()
+        torch.cuda.synchronize(device)
+        gather_ms = float(ev0.elapsed_time(ev1))
+        merge_ms = float(ev1.elapsed_time(ev2))
+        logger.info(
+            "[sparse_all_gather] world_size=%s k=%s numel=%s gather_ms=%.3f merge_ms=%.3f",
+            world_size,
+            k,
+            numel,
+            gather_ms,
+            merge_ms,
+        )
 
     return full
 

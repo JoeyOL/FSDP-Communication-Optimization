@@ -4,6 +4,7 @@ import torch
 import torch.distributed as dist
 
 from .common import _apply_error_feedback, _ensure_residual
+from perf.comm_stats import add_bytes as _comm_add_bytes
 
 
 class GradQuantState:
@@ -81,21 +82,43 @@ def fsdp_quantized_comm_hook(
     scale_val = global_max.clamp(min=1e-8).item()
 
     if getattr(state, "variant", "linear") == "dynamic_tree":
-        q_grad = _int8_dynamic_tree_quantize(g, scale_val)
-        full_size = q_grad.numel()
-        if hasattr(dist, "all_gather_into_tensor"):
-            all_q = torch.empty(world_size * full_size, device=g.device, dtype=torch.uint8)
-            dist.all_gather_into_tensor(all_q, q_grad.contiguous(), group=pg)
+        # 动态树 8bit：保持 7-bit 随机舍入的量化形式，但通信改为 int16 + reduce_scatter，
+        # 使每个 rank 只处理自己 shard 的数据，避免 all_gather 的 O(world_size * numel) 开销。
+        if scale_val < 1e-8:
+            shard_out.zero_()
         else:
-            all_q = torch.cat(dist.all_gather(q_grad.contiguous(), group=pg), dim=0)
-        all_decoded = _int8_dynamic_tree_dequantize(all_q.view(world_size, full_size), scale_val)
-        full_sum = all_decoded.sum(dim=0)
-        shard_size = numel // world_size
-        rank = dist.get_rank(pg)
-        shard_start = rank * shard_size
-        shard_end = shard_start + shard_size
-        deq_avg = (full_sum[shard_start:shard_end] / float(world_size)).to(full_flat_grad.dtype)
-        shard_out.copy_(deq_avg)
+            # 生成 7-bit level 和符号，并编码为有符号整型：signed_level ∈ [-127, 127]
+            g_abs = g.abs()
+            g_norm = (g_abs / scale_val).clamp(0.0, 1.0)
+            level_float = g_norm * 127.0
+            lo = level_float.floor().clamp(0, 126)
+            hi = level_float.ceil().clamp(1, 127)
+            u = torch.empty_like(g, dtype=torch.float32).uniform_(0, 1)
+            lev = torch.where(u < (level_float - lo), hi, lo).to(torch.int32)
+            sign = torch.where(g >= 0, 1, -1).to(torch.int32)
+            signed_level = (sign * lev).view(-1)
+
+            shard_size = numel // world_size
+            temp_shard_level = torch.empty(shard_size, device=g.device, dtype=torch.int32)
+            if hasattr(dist, "reduce_scatter_tensor"):
+                dist.reduce_scatter_tensor(
+                    temp_shard_level, signed_level, op=dist.ReduceOp.SUM, group=pg
+                )
+            else:
+                chunks = list(signed_level.chunk(world_size, dim=0))
+                dist.reduce_scatter(
+                    temp_shard_level, chunks, op=dist.ReduceOp.SUM, group=pg
+                )
+
+            # 近似统计：按 signed_level 元素数估算 reduce_scatter 负载
+            try:
+                _comm_add_bytes(state, signed_level.numel() * signed_level.element_size())
+            except Exception:
+                pass
+
+            deq_sum = temp_shard_level.to(torch.float32) * (scale_val / 127.0)
+            deq_avg = (deq_sum / float(world_size)).to(full_flat_grad.dtype)
+            shard_out.copy_(deq_avg)
     else:
         qr = max(1, 127 // world_size)
         scale = qr / torch.clamp(global_max, min=1e-8)
@@ -106,6 +129,12 @@ def fsdp_quantized_comm_hook(
         else:
             chunks = list(q_grad.chunk(world_size, dim=0))
             dist.reduce_scatter(temp_shard_out, chunks, op=dist.ReduceOp.SUM, group=pg)
+
+        # 近似统计：按 q_grad 元素数估算 reduce_scatter 负载
+        try:
+            _comm_add_bytes(state, q_grad.numel() * q_grad.element_size())
+        except Exception:
+            pass
         deq_sum = temp_shard_out.float() / scale
         deq_avg = (deq_sum / float(world_size)).to(full_flat_grad.dtype)
         shard_out.copy_(deq_avg)

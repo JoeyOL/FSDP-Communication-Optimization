@@ -2,6 +2,7 @@ import torch
 import torch.distributed as dist
 
 from .common import _apply_error_feedback, _ensure_residual
+from perf.comm_stats import add_bytes as _comm_add_bytes
 
 
 class HybridTopKInt8State:
@@ -53,6 +54,11 @@ def fsdp_hybrid_topk_int8_comm_hook(
     else:
         chunks = list(q_grad.chunk(world_size, dim=0))
         dist.reduce_scatter(temp_shard_out, chunks, op=dist.ReduceOp.SUM, group=pg)
+    # 近似统计：按 q_grad 元素数估算 reduce_scatter 负载
+    try:
+        _comm_add_bytes(state, q_grad.numel() * q_grad.element_size())
+    except Exception:
+        pass
 
     deq_sum = temp_shard_out.float() / scale
     deq_avg = (deq_sum / float(world_size)).to(full_flat_grad.dtype)

@@ -3,7 +3,13 @@ from typing import Tuple
 import torch
 import torch.distributed as dist
 
-from .common import _apply_error_feedback, _ensure_residual, _sparse_all_gather_and_merge
+from .common import _apply_error_feedback, _ensure_residual, _sparse_all_gather_and_merge, logger
+from perf.comm_stats import add_bytes as _comm_add_bytes
+
+
+# 仅在前几次调用、且 rank0 上打印关键步骤，帮助定位耗时环节
+_THRESHOLDV_LOG_CAP = 50
+_thresholdv_log_count = 0
 
 
 class ThresholdVState:
@@ -66,53 +72,185 @@ def fsdp_thresholdv_comm_hook(
     """Threshold-v: 只传 |g_i| > v 的维度；sparse_comm 时只传 (indices, values)，固定 k 长。"""
     pg = dist.group.WORLD
     world_size = dist.get_world_size(pg)
+    rank = dist.get_rank(pg)
+
+    global _thresholdv_log_count
+    _thresholdv_log_count += 1
+    do_log = rank == 0 and _thresholdv_log_count <= _THRESHOLDV_LOG_CAP
 
     if world_size == 1:
         shard_out.copy_(full_flat_grad)
         return
 
     g = full_flat_grad.contiguous().view(-1)
+    numel = g.numel()
+    if do_log:
+        logger.info(
+            "[threshold_v] hook_start numel=%s ratio=%.4f sparse_comm=%s ef=%s (call#%s)",
+            numel,
+            state.ratio,
+            state.sparse_comm,
+            state.error_feedback,
+            _thresholdv_log_count,
+        )
+        if g.device.type == "cuda":
+            ev_start = torch.cuda.Event(enable_timing=True)
+            ev_after_ef = torch.cuda.Event(enable_timing=True)
+            ev_after_thresh = torch.cuda.Event(enable_timing=True)
+            ev_after_select = torch.cuda.Event(enable_timing=True)
+            ev_after_allgather = torch.cuda.Event(enable_timing=True)
+            ev_after_copy = torch.cuda.Event(enable_timing=True)
+            ev_end = torch.cuda.Event(enable_timing=True)
+            ev_start.record()
     if state.error_feedback:
         residual, start, end = _ensure_residual(state, g, pg)
         if start is None:
+            if do_log:
+                logger.info("[threshold_v] apply_error_feedback full residual")
             g = (g + residual).to(g.dtype)
         else:
+            if do_log:
+                logger.info("[threshold_v] apply_error_feedback local residual slice [%s:%s]", start, end)
             g[start:end] += residual
 
-    numel = g.numel()
+    if do_log and g.device.type == "cuda":
+        ev_after_ef.record()
+
     k = max(1, int(numel * state.ratio))
 
     if state.v > 0 or state.v_neg > 0:
+        # 用户显式给定阈值，严格按 v/v_neg 执行
         v_pos = state.v_pos
         v_neg = state.v_neg_val
     else:
+        # 自动阈值：k=ratio*numel，但为了加速，不再对 full g 做精确 kthvalue，
+        # 而是对抽样子集做近似分位数估计，大幅降低 O(numel) 的开销。
+        if do_log:
+            logger.info("[threshold_v] auto threshold start (k=%s)", k)
         abs_g = g.abs()
-        # kthvalue returns k-th smallest; k-th largest = (numel - k + 1)-th smallest
-        idx = max(1, min(numel, numel - k + 1))
-        v_pos = v_neg = torch.kthvalue(abs_g, idx).values.item()
+        # 对大向量做抽样近似：最多采样 sample_cap 个点
+        sample_cap = 200_000
+        if numel <= sample_cap:
+            # 小向量直接用精确 kthvalue
+            idx = max(1, min(numel, numel - k + 1))
+            v_tensor = torch.kthvalue(abs_g, idx).values
+            if do_log:
+                logger.info("[threshold_v] auto threshold exact on full tensor (idx=%s)", idx)
+        else:
+            stride = max(1, numel // sample_cap)
+            sample = abs_g[::stride]
+            m = sample.numel()
+            # 在抽样上使用相同比例的分位数
+            k_sample = max(1, min(m, m - int(m * state.ratio) + 1))
+            v_tensor = torch.kthvalue(sample, k_sample).values
+            if do_log:
+                logger.info(
+                    "[threshold_v] auto threshold approx on sample: numel=%s sample=%s k_sample=%s",
+                    numel,
+                    m,
+                    k_sample,
+                )
+        v_pos = v_neg = float(v_tensor.item())
+        if do_log:
+            logger.info("[threshold_v] auto threshold done v=%.6e", v_pos)
+
+    if do_log and g.device.type == "cuda":
+        ev_after_thresh.record()
 
     if state.sparse_comm:
+        if do_log:
+            logger.info("[threshold_v] sparse path: select indices/values")
         indices, values = _thresholdv_to_fixed_k_indices_values(g, v_pos, v_neg, k)
-        full_sum = _sparse_all_gather_and_merge(g.new_tensor(indices, dtype=torch.long), values, numel, pg)
+        if do_log:
+            nnz = int((values != 0).sum().item())
+            logger.info("[threshold_v] sparse path: selected nnz=%s (k=%s)", nnz, k)
+            logger.info("[threshold_v] sparse path: all_gather_and_merge start")
+
+        if do_log and g.device.type == "cuda":
+            ev_after_select.record()
+
+        # 打开 common._sparse_all_gather_and_merge 的内部计时（仅本次调用）
+        if do_log:
+            setattr(state, "_debug_sparse_allgather_timing", True)
+        try:
+            full_sum = _sparse_all_gather_and_merge(state, g.new_tensor(indices, dtype=torch.long), values, numel, pg)
+        finally:
+            if do_log:
+                setattr(state, "_debug_sparse_allgather_timing", False)
+        if do_log:
+            logger.info("[threshold_v] sparse path: all_gather_and_merge done")
+
+        if do_log and g.device.type == "cuda":
+            ev_after_allgather.record()
         shard_size = numel // world_size
-        rank = dist.get_rank(pg)
         shard_start = rank * shard_size
         shard_end = shard_start + shard_size
         deq_avg = (full_sum[shard_start:shard_end] / float(world_size)).to(full_flat_grad.dtype)
         shard_out.copy_(deq_avg)
+
+        if do_log and g.device.type == "cuda":
+            ev_after_copy.record()
         if state.error_feedback:
-            sparse_full = torch.where((g >= v_pos) | (g <= -v_neg), g, torch.zeros_like(g))
-            _apply_error_feedback(state, full_flat_grad, shard_out, sparse_full, pg)
+            if getattr(state, "_ef_local", False):
+                # 本地 EF：直接在 shard 维度上更新 residual，避免构造 dense full 向量和额外 all_gather。
+                idx = getattr(state, "_ef_index", 1) - 1
+                res_list = getattr(state, "_ef_residual_list", None)
+                if (
+                    idx >= 0
+                    and res_list is not None
+                    and idx < len(res_list)
+                    and res_list[idx] is not None
+                    and res_list[idx].numel() == shard_size
+                ):
+                    approx_shard = (full_sum[shard_start:shard_end] / float(world_size)).to(g.dtype)
+                    res_list[idx].copy_(g[shard_start:shard_end] - approx_shard)
+            else:
+                # 非本地 EF 保持原有 dense 方式
+                sparse_full = torch.where((g >= v_pos) | (g <= -v_neg), g, torch.zeros_like(g))
+                _apply_error_feedback(state, full_flat_grad, shard_out, sparse_full, pg)
+        if do_log:
+            logger.info("[threshold_v] sparse path: apply_error_feedback done")   
+
+        if do_log and g.device.type == "cuda":
+            ev_end.record()
+            torch.cuda.synchronize(g.device)
+            ms_ef = float(ev_start.elapsed_time(ev_after_ef))
+            ms_thresh = float(ev_after_ef.elapsed_time(ev_after_thresh))
+            ms_select = float(ev_after_thresh.elapsed_time(ev_after_select))
+            ms_allg = float(ev_after_select.elapsed_time(ev_after_allgather))
+            ms_copy = float(ev_after_allgather.elapsed_time(ev_after_copy))
+            ms_tail = float(ev_after_copy.elapsed_time(ev_end))
+            logger.info(
+                "[threshold_v][timing] ef=%.3fms thresh=%.3fms select=%.3fms allgather+merge=%.3fms copy=%.3fms ef_update=%.3fms",
+                ms_ef,
+                ms_thresh,
+                ms_select,
+                ms_allg,
+                ms_copy,
+                ms_tail,
+            )
         return
 
+    if do_log:
+        logger.info("[threshold_v] dense fallback path: build sparse mask")
     sparse = torch.where((g >= v_pos) | (g <= -v_neg), g, torch.zeros_like(g))
     shard_size = numel // world_size
     temp_shard = torch.empty(shard_size, device=g.device, dtype=g.dtype)
+    if do_log:
+        logger.info("[threshold_v] dense fallback path: reduce_scatter start")
     if hasattr(dist, "reduce_scatter_tensor"):
         dist.reduce_scatter_tensor(temp_shard, sparse, op=dist.ReduceOp.SUM, group=pg)
     else:
         chunks = list(sparse.chunk(world_size, dim=0))
         dist.reduce_scatter(temp_shard, chunks, op=dist.ReduceOp.SUM, group=pg)
+    if do_log:
+        logger.info("[threshold_v] dense fallback path: reduce_scatter done")
+
+    # 近似统计：按输入 sparse 的元素数估算 reduce_scatter 负载
+    try:
+        _comm_add_bytes(state, sparse.numel() * sparse.element_size())
+    except Exception:
+        pass
 
     deq_avg = (temp_shard / float(world_size)).to(full_flat_grad.dtype)
     shard_out.copy_(deq_avg)
