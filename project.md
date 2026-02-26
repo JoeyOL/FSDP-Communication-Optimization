@@ -170,14 +170,14 @@ chmod +x scripts/step1_profile.sh
 
 目标：让每个压缩方法的效果可以被同一套指标与同一份结果文件直接对比与画图。
 
-建议的最小指标集合（中期必须落盘）：
+建议的最小指标集合（中期必须落盘，均以**后向梯度通信**为主要统计口径）：
 
 - 通信压缩（“压了多少”）：
-  - 原始通信字节数 vs 压缩后通信字节数（必须包含索引/元数据/scale 等开销），以及压缩比。
+  - 原始后向梯度通信字节数 vs 压缩后字节数（必须包含索引/元数据/scale 等开销），以及压缩比。
   - 稀疏化密度：非零占比（density）/稀疏率（sparsity），以及索引编码开销占比（index_bytes / bytes_compressed）。
 - 通信时间（“省了多少通信时间”）：
-  - 每 step 通信耗时（总）与占比。
-  - 按算子拆分：`reduce_scatter` / `all_gather` / `all_reduce` 等（至少覆盖反向相关通信）。
+  - 每 step 后向梯度通信耗时（总）与占比。
+  - 按算子拆分：`reduce_scatter` / `all_gather` / `all_reduce` 等（至少覆盖反向阶段相关通信）。
 - 训练效率（“端到端快了多少”）：
   - step time（均值/中位数 + P90/P95），tokens/s。
   - GPU 显存峰值（allocated / reserved）。
@@ -191,7 +191,7 @@ chmod +x scripts/step1_profile.sh
   - `quality_at_time`：固定训练时间预算下的 PPL/val loss（更贴近工程）。
 - 重叠与可扩展性（通信优化的核心）：
   - 通信-计算重叠率：通信算子与计算算子重叠的时间比例（profiler 可估）。
-  - 有效通信带宽：`effective_bw = bytes_raw / comm_time`（以及压缩后 `bytes_compressed / comm_time`），用于量化“链路利用率”。
+  - 有效通信带宽：针对后向梯度通信，`effective_bw = bytes_raw / comm_time`（以及压缩后 `bytes_compressed / comm_time`），用于量化“链路利用率”。
   - scaling efficiency：从 1 卡到 2 卡（再到更多卡）时 tokens/s 增长比例与 step time 变化。
 - 算法/实现开销（很多压缩方法会把收益吃掉）：
   - 压缩/解压耗时：`compress_time_ms`、`decompress_time_ms`（最好按 GPU kernel/CPU 逻辑区分）。

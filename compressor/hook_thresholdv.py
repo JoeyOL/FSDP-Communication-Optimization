@@ -116,43 +116,76 @@ def fsdp_thresholdv_comm_hook(
     if do_log and g.device.type == "cuda":
         ev_after_ef.record()
 
-    k = max(1, int(numel * state.ratio))
+    k_total = max(1, int(numel * state.ratio))
 
     if state.v > 0 or state.v_neg > 0:
         # 用户显式给定阈值，严格按 v/v_neg 执行
         v_pos = state.v_pos
         v_neg = state.v_neg_val
     else:
-        # 自动阈值：k=ratio*numel，但为了加速，不再对 full g 做精确 kthvalue，
-        # 而是对抽样子集做近似分位数估计，大幅降低 O(numel) 的开销。
+        # 自动双阈值：以目标稀疏率 ratio 为总预算，在正、负两侧分别估计分位数阈值 v_pos / v_neg。
+        # 为降低开销，大向量上仍采用抽样近似。
         if do_log:
-            logger.info("[threshold_v] auto threshold start (k=%s)", k)
-        abs_g = g.abs()
-        # 对大向量做抽样近似：最多采样 sample_cap 个点
-        sample_cap = 200_000
-        if numel <= sample_cap:
-            # 小向量直接用精确 kthvalue
-            idx = max(1, min(numel, numel - k + 1))
-            v_tensor = torch.kthvalue(abs_g, idx).values
-            if do_log:
-                logger.info("[threshold_v] auto threshold exact on full tensor (idx=%s)", idx)
+            logger.info("[threshold_v] auto dual-threshold start (k_total=%s, ratio=%.4f)", k_total, state.ratio)
+
+        g_pos = g[g > 0]
+        g_neg = (-g[g < 0])  # 负侧用绝对值
+        n_pos = int(g_pos.numel())
+        n_neg = int(g_neg.numel())
+
+        if n_pos + n_neg == 0:
+            # 退化情况：梯度全为 0
+            v_pos = v_neg = 0.0
         else:
-            stride = max(1, numel // sample_cap)
-            sample = abs_g[::stride]
-            m = sample.numel()
-            # 在抽样上使用相同比例的分位数
-            k_sample = max(1, min(m, m - int(m * state.ratio) + 1))
-            v_tensor = torch.kthvalue(sample, k_sample).values
-            if do_log:
-                logger.info(
-                    "[threshold_v] auto threshold approx on sample: numel=%s sample=%s k_sample=%s",
-                    numel,
-                    m,
-                    k_sample,
-                )
-        v_pos = v_neg = float(v_tensor.item())
+            # 按正负两侧占比分配总的“保留预算”
+            k_pos = int(round(k_total * (n_pos / (n_pos + n_neg)))) if n_pos > 0 else 0
+            k_neg = k_total - k_pos
+            k_pos = max(0, min(n_pos, k_pos))
+            k_neg = max(0, min(n_neg, k_neg))
+
+            sample_cap = 200_000
+
+            def _estimate_quantile_side(abs_side: torch.Tensor, n_side: int, k_side: int, label: str) -> float:
+                if n_side == 0 or k_side <= 0:
+                    return 0.0
+                if n_side <= sample_cap:
+                    idx = max(1, min(n_side, n_side - k_side + 1))
+                    v_t = torch.kthvalue(abs_side, idx).values
+                    if do_log:
+                        logger.info(
+                            "[threshold_v] auto %s-threshold exact: n=%s idx=%s v=%.6e",
+                            label,
+                            n_side,
+                            idx,
+                            float(v_t.item()),
+                        )
+                    return float(v_t.item())
+                # 抽样近似
+                stride = max(1, n_side // sample_cap)
+                sample = abs_side[::stride]
+                m = int(sample.numel())
+                if m == 0:
+                    return 0.0
+                # 在样本上使用相同比例的分位数
+                # 目标在该侧的比例约为 k_side / n_side
+                k_sample = max(1, min(m, m - int(m * (k_side / max(1, n_side))) + 1))
+                v_t = torch.kthvalue(sample, k_sample).values
+                if do_log:
+                    logger.info(
+                        "[threshold_v] auto %s-threshold approx: n=%s m=%s k_sample=%s v=%.6e",
+                        label,
+                        n_side,
+                        m,
+                        k_sample,
+                        float(v_t.item()),
+                    )
+                return float(v_t.item())
+
+            v_pos = _estimate_quantile_side(g_pos.abs(), n_pos, k_pos, "pos")
+            v_neg = _estimate_quantile_side(g_neg.abs(), n_neg, k_neg, "neg")
+
         if do_log:
-            logger.info("[threshold_v] auto threshold done v=%.6e", v_pos)
+            logger.info("[threshold_v] auto dual-threshold done v_pos=%.6e v_neg=%.6e", v_pos, v_neg)
 
     if do_log and g.device.type == "cuda":
         ev_after_thresh.record()
@@ -160,10 +193,11 @@ def fsdp_thresholdv_comm_hook(
     if state.sparse_comm:
         if do_log:
             logger.info("[threshold_v] sparse path: select indices/values")
-        indices, values = _thresholdv_to_fixed_k_indices_values(g, v_pos, v_neg, k)
+        # 稀疏通信路径下，按照目标总预算 k_total 选择不超过 k_total 个坐标。
+        indices, values = _thresholdv_to_fixed_k_indices_values(g, v_pos, v_neg, k_total)
         if do_log:
             nnz = int((values != 0).sum().item())
-            logger.info("[threshold_v] sparse path: selected nnz=%s (k=%s)", nnz, k)
+            logger.info("[threshold_v] sparse path: selected nnz=%s (k_total=%s)", nnz, k_total)
             logger.info("[threshold_v] sparse path: all_gather_and_merge start")
 
         if do_log and g.device.type == "cuda":

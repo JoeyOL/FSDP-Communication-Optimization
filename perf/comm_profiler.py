@@ -143,14 +143,26 @@ def init_monitoring(args: Any, rank: int, epoch_steps: int) -> MonitoringContext
 
     约定：
     - `args.profile` 默认为 True（如果训练脚本未提供该参数，则按 True 处理，保持原行为）。
+    - `args.tensorboard` 为三态：
+        - None：沿用旧行为（tb 开关跟随 profile）
+        - True：即使关闭 profiler，也写 TensorBoard 标量
+        - False：不写 TensorBoard 标量
     - `args.profile_step_time` 控制是否采集 step wall time（可选；本模块不再在训练时写 summary 文件）。
     """
 
     if rank != 0:
         return MonitoringContext(rank=rank, enabled=False)
 
-    enabled = _bool_arg(args, "profile", True)
-    if not enabled:
+    prof_enabled = _bool_arg(args, "profile", True)
+
+    # 保持向后兼容：若未显式提供 tensorboard 开关，则 TensorBoard 只在 profile 开时启用（旧行为）。
+    tb_flag = getattr(args, "tensorboard", None)
+    if tb_flag is None:
+        tb_enabled = prof_enabled
+    else:
+        tb_enabled = bool(tb_flag)
+
+    if not (tb_enabled or prof_enabled):
         return MonitoringContext(rank=rank, enabled=False)
 
     output_dir = Path(getattr(args, "output_dir", "."))
@@ -158,31 +170,35 @@ def init_monitoring(args: Any, rank: int, epoch_steps: int) -> MonitoringContext
     log_dir = output_dir / "logs" / run_name
     tb_log_dir = log_dir / "tensorboard"
     profiler_log_dir = log_dir / "profiler"
-    tb_log_dir.mkdir(parents=True, exist_ok=True)
-    profiler_log_dir.mkdir(parents=True, exist_ok=True)
+    tb_writer: Optional[SummaryWriter] = None
+    prof: Optional[torch.profiler.profile] = None
 
-    tb_writer = SummaryWriter(log_dir=str(tb_log_dir))
+    if tb_enabled:
+        tb_log_dir.mkdir(parents=True, exist_ok=True)
+        tb_writer = SummaryWriter(log_dir=str(tb_log_dir))
 
-    active_steps = max(1, min(int(epoch_steps), 50))
-    schedule = torch.profiler.schedule(wait=1, warmup=1, active=active_steps, repeat=1)
-    prof = torch.profiler.profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        schedule=schedule,
-        on_trace_ready=torch.profiler.tensorboard_trace_handler(str(profiler_log_dir)),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True,
-        with_flops=True,
-        with_modules=True,
-    )
-    prof.start()
+    if prof_enabled:
+        profiler_log_dir.mkdir(parents=True, exist_ok=True)
+        active_steps = max(1, min(int(epoch_steps), 50))
+        schedule = torch.profiler.schedule(wait=1, warmup=1, active=active_steps, repeat=1)
+        prof = torch.profiler.profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=schedule,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(str(profiler_log_dir)),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            with_flops=True,
+            with_modules=True,
+        )
+        prof.start()
 
     return MonitoringContext(
         rank=rank,
         enabled=True,
         log_dir=log_dir,
-        tb_log_dir=tb_log_dir,
-        profiler_log_dir=profiler_log_dir,
+        tb_log_dir=(tb_log_dir if tb_enabled else None),
+        profiler_log_dir=(profiler_log_dir if prof_enabled else None),
         tb_writer=tb_writer,
         prof=prof,
     )

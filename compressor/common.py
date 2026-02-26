@@ -122,10 +122,12 @@ def _apply_error_feedback(
         start = getattr(state, "_ef_shard_start", 0)
         end = getattr(state, "_ef_shard_end", 0)
         if residual.numel() == shard_out.numel() and end <= to_compress.numel():
+            # Local EF: residual 仅在本 rank shard 上维护，不做全量 all_gather。
             residual.copy_(to_compress[start:end] - shard_out)
         return
     full_reconstructed = _all_gather_shard(state, shard_out, group=group)
     if residual.numel() == to_compress.numel():
+        # Full EF: residual = 原始梯度与全量重建梯度的差值。
         residual.copy_(to_compress - full_reconstructed)
 
 

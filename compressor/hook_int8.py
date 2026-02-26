@@ -110,9 +110,9 @@ def fsdp_quantized_comm_hook(
                     temp_shard_level, chunks, op=dist.ReduceOp.SUM, group=pg
                 )
 
-            # 近似统计：按 signed_level 元素数估算 reduce_scatter 负载
+            # 近似统计：按每个 rank 输出 shard 的元素数估算 reduce_scatter 负载
             try:
-                _comm_add_bytes(state, signed_level.numel() * signed_level.element_size())
+                _comm_add_bytes(state, temp_shard_level.numel() * temp_shard_level.element_size())
             except Exception:
                 pass
 
@@ -130,9 +130,9 @@ def fsdp_quantized_comm_hook(
             chunks = list(q_grad.chunk(world_size, dim=0))
             dist.reduce_scatter(temp_shard_out, chunks, op=dist.ReduceOp.SUM, group=pg)
 
-        # 近似统计：按 q_grad 元素数估算 reduce_scatter 负载
+        # 近似统计：按每个 rank 输出 shard 的元素数估算 reduce_scatter 负载
         try:
-            _comm_add_bytes(state, q_grad.numel() * q_grad.element_size())
+            _comm_add_bytes(state, temp_shard_out.numel() * temp_shard_out.element_size())
         except Exception:
             pass
         deq_sum = temp_shard_out.float() / scale

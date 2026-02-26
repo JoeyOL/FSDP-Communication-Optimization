@@ -41,6 +41,13 @@ Step1: 一键启动耗时取证（torch.profiler + step wall time + overlap）
   <output_dir>/logs/<run_name>/profiler/*.pt.trace.json
   <output_dir>/logs/<run_name>/profiler/summary_rank0.json （离线脚本生成）
   <output_dir>/logs/<run_name>/profiler/comm_op_summary_rank0.csv （离线脚本生成）
+  <output_dir>/logs/<run_name>/tensorboard/events.out.tfevents.* （训练 loss、显存、学习率等）
+  <output_dir>/logs/<run_name>/config.json
+
+训练指标汇总（训练结束后在项目根目录执行）：
+  python tools/collect_training_metrics.py --log_dir <output_dir>/logs/<run_name>
+  # 输出 loss/显存曲线、吞吐(tokens/s) 到 <log_dir>/training_metrics.json
+  # 若需验证集 PPL，传入 --val_data /path/to/val.json（会使用 <output_dir>/final_model）
 
 示例：
   # 单机 1 卡

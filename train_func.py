@@ -16,6 +16,7 @@ from perf.comm_profiler import (
     step_end,
 )
 from perf.comm_stats import snapshot as comm_snapshot, total_bytes as comm_total_bytes
+from perf.grad_error_stats import snapshot as grad_error_snapshot
 
 
 # --- 新增带监控的训练函数 ---
@@ -92,6 +93,12 @@ def train_epoch_with_monitoring(model, dataloader, optimizer, scheduler, epoch, 
             torch.cuda.empty_cache()
             continue
         except Exception as e:
+            # 对于明确的数值错误（例如 NC 路径检测到的非有限值），直接中止本次训练，
+            # 避免在后续 step 中重复触发相同错误。
+            msg = str(e)
+            if "[nc] detected non-finite" in msg:
+                logger.error(f"训练步骤 {batch_idx} 检测到 NC 数值错误，终止当前训练: {e}")
+                raise
             logger.error(f"训练步骤 {batch_idx} 发生未知错误: {e}")
             continue
 
@@ -124,7 +131,7 @@ def train_epoch_with_monitoring(model, dataloader, optimizer, scheduler, epoch, 
 
     avg_loss = total_loss / num_batches
 
-    # 在 rank0 上将轻量通信统计写入 log_dir，供 tools/compute_trace_stats.py 使用。
+    # 在 rank0 上将轻量通信统计与梯度误差统计写入 log_dir，供离线分析使用。
     if rank == 0:
         try:
             hooks = comm_snapshot()
@@ -151,6 +158,22 @@ def train_epoch_with_monitoring(model, dataloader, optimizer, scheduler, epoch, 
             )
         except Exception as e:
             logger.warning(f"[comm_stats] failed to write runtime comm stats: {e}")
+
+        # 梯度压缩误差统计：当前仅在启用误差反馈的压缩 hook 中生效，
+        # 通过 perf.grad_error_stats 在各个 hook 内部累积相对 L2 误差。
+        try:
+            grad_stats = grad_error_snapshot()
+            if grad_stats:
+                (log_dir / "grad_error_stats_rank0.json").write_text(
+                    json.dumps({"by_hook": grad_stats}, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                logger.info(
+                    "[grad_error_stats] wrote runtime grad error stats to %s",
+                    log_dir / "grad_error_stats_rank0.json",
+                )
+        except Exception as e:
+            logger.warning(f"[grad_error_stats] failed to write runtime grad error stats: {e}")
 
     return avg_loss
     

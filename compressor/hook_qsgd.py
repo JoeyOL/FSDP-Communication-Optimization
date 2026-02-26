@@ -241,6 +241,11 @@ def fsdp_qsgd_comm_hook(
     use_low_bits_whole = (state.bucket_size <= 0 or state.bucket_size >= numel) and (shard_size > 0)
     # 对按桶 QSGD，低比特 + bit 编码 + all_to_all 在 Python 实现下开销过大，这里仅在“整向量一桶”时启用低比特路径。
     use_low_bits = getattr(state, "low_bit_comm", True) and use_low_bits_whole
+    # 若每坐标比特数不能整除 8，则 bit 打包需要逐元素处理，复杂度过高，这里退化为 float16 通道以避免“卡死”。
+    if use_low_bits:
+        bits = _qsgd_bits_per_elem(state.s)
+        if 8 % bits != 0:
+            use_low_bits = False
 
     global _qsgd_hook_log_count
     _qsgd_hook_log_count += 1
@@ -249,8 +254,8 @@ def fsdp_qsgd_comm_hook(
     if do_log:
         if use_low_bits_whole:
             logger.info(
-                "[QSGD hook] rank=%s whole-vector (low-bit) path numel=%s shard_size=%s ef=%s (call#%s)",
-                rank, numel, shard_size, state.error_feedback, _qsgd_hook_log_count,
+                "[QSGD hook] rank=%s whole-vector path numel=%s shard_size=%s ef=%s low_bits=%s (call#%s)",
+                rank, numel, shard_size, state.error_feedback, bool(use_low_bits), _qsgd_hook_log_count,
             )
 
     g = full_flat_grad.contiguous().view(-1)

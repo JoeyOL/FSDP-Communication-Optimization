@@ -141,6 +141,12 @@ def main():
 
     # --- Step1/取证：耗时 profiling 与短跑 ---
     parser.add_argument(
+        '--tensorboard',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help='是否写 TensorBoard 标量（loss/显存等）。默认沿用旧行为：跟随 --profile；可用 --tensorboard 在 --no-profile 时仍写标量；--no-tensorboard 强制关闭',
+    )
+    parser.add_argument(
         '--profile',
         action=argparse.BooleanOptionalAction,
         default=True,

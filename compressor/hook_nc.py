@@ -10,12 +10,15 @@ Natural Compression (NC): round to ±2^k, optional 9-bit packing for communicati
 import torch
 import torch.distributed as dist
 
-from .common import _apply_error_feedback, _ensure_residual
+from .common import _apply_error_feedback, _ensure_residual, logger
 from perf.comm_stats import add_bytes as _comm_add_bytes
 
-# Exponent range for ±2^k: k in [-127, 127], stored as k_stored = k + 128 in [1, 255]. 0 → code 0.
+# Exponent range for ±2^k: 为了避免 exp2 溢出到 float32 上界，这里使用更保守的指数区间。
+# 理论上 float32 的安全指数约在 [-126, 127]，但在多卡求和时极大值仍可能在 reduce/all_to_all
+# 后产生 Inf。综合实验规模与数值稳定性，本实现将 k 限制在较窄的区间 [-60, 60]：
+#   2^60 ≈ 1e18，远低于 float32 最大值，即便多卡求和也有较大安全裕度。
 _K_OFFSET = 128
-_K_MIN, _K_MAX = -127, 127
+_K_MIN, _K_MAX = -60, 60
 
 
 class NCState:
@@ -41,8 +44,10 @@ def _nc_compress_scalar(t: torch.Tensor) -> torch.Tensor:
     t_nz = t[~zero]
     abs_t = t_nz.abs()
     alpha = torch.log2(abs_t)
-    lo = torch.exp2(alpha.floor())
-    hi = torch.exp2(alpha.ceil())
+    # 将指数限制在 [_K_MIN, _K_MAX] 内，避免 exp2 溢出。
+    alpha_clamped = alpha.clamp(min=float(_K_MIN), max=float(_K_MAX))
+    lo = torch.exp2(alpha_clamped.floor())
+    hi = torch.exp2(alpha_clamped.ceil())
     p = (abs_t - lo) / (hi - lo + 1e-12)
     u = torch.empty_like(t_nz, device=t.device).uniform_(0, 1)
     choice = torch.where(u < p, hi, lo)
@@ -155,6 +160,12 @@ def fsdp_nc_comm_hook(
         return
 
     g = full_flat_grad.contiguous().view(-1)
+
+    # 安全检查 1：输入梯度必须是有限值
+    if not torch.isfinite(g).all():
+        raise RuntimeError(
+            "[nc] detected non-finite gradient (NaN/Inf) before compression; aborting this training run"
+        )
     if state.error_feedback:
         residual, start, end = _ensure_residual(state, g, pg)
         if start is None:
@@ -167,13 +178,40 @@ def fsdp_nc_comm_hook(
     g_for_ef = g
     if getattr(state, "use_norm_scale", True):
         # 范数缩放：在归一化空间量化，避免小分量被舍入为 0，改善 loss
+        # 第一步数值稳定改动：
+        # 1）对 global_norm 加下界 tiny，避免除 0；
+        # 2）对缩放因子 1/global_norm 做上界裁剪，避免 scale 过大导致量化空间过窄；
+        # 3）当 global_norm 极小时，直接跳过范数缩放（scale=1），视为该步梯度近似 0。
         norm_sq = (g * g).sum().to(torch.float32)
         dist.all_reduce(norm_sq, op=dist.ReduceOp.SUM, group=pg)
-        global_norm = max(norm_sq.sqrt().item(), 1e-12)
-        scale = 1.0 / global_norm
-        g = g * scale
+        global_norm = norm_sq.sqrt()
+
+        eps = 1e-6
+        tiny_norm = 1e-3
+        max_scale = 1e3
+
+        if not torch.isfinite(global_norm):
+            # 若范数本身非有限，放弃缩放，保持原梯度（后续安全检查仍会兜底）
+            global_norm_val = 1.0
+            do_scale = False
+        else:
+            global_norm_val = float(global_norm.item())
+            # 极小范数：梯度整体接近 0，直接跳过缩放，避免被 1/tiny 放大
+            do_scale = global_norm_val > tiny_norm
+
+        if do_scale:
+            inv_norm = 1.0 / max(global_norm_val, eps)
+            inv_norm = min(inv_norm, max_scale)
+            scale = inv_norm
+            g = g * scale
 
     q_g = _nc_compress_scalar(g)
+
+    # 安全检查 2：量化后的张量也必须是有限值
+    if not torch.isfinite(q_g).all():
+        raise RuntimeError(
+            "[nc] detected non-finite value after NC quantization; aborting this training run"
+        )
     shard_size = g.numel() // world_size
 
     if state.use_bit_packing:
@@ -210,6 +248,46 @@ def fsdp_nc_comm_hook(
     deq_avg = (temp_shard / float(world_size)).to(full_flat_grad.dtype)
     if getattr(state, "use_norm_scale", True):
         deq_avg = deq_avg / scale
+
+    # 安全检查 3：反量化并求平均后的 shard 也必须是有限值。
+    # 若检测到非有限值，附带打印相关的指数范围信息，便于诊断是哪一侧的 k 仍然过大。
+    if not torch.isfinite(deq_avg).all():
+        try:
+            with torch.no_grad():
+                abs_g = g.abs()
+                # 避免 log2(0)
+                alpha = torch.log2(abs_g.clamp(min=1e-12))
+                finite_alpha = alpha[torch.isfinite(alpha)]
+                if finite_alpha.numel() > 0:
+                    max_k_before = float(finite_alpha.max().item())
+                    min_k_before = float(finite_alpha.min().item())
+                else:
+                    max_k_before = float("nan")
+                    min_k_before = float("nan")
+
+                alpha_clamped = alpha.clamp(min=float(_K_MIN), max=float(_K_MAX))
+                max_k_after = float(alpha_clamped.max().item())
+                min_k_after = float(alpha_clamped.min().item())
+
+                bad_mask = ~torch.isfinite(deq_avg)
+                bad_count = int(bad_mask.sum().item())
+
+                logger.error(
+                    "[nc] non-finite dequantized shard detected: bad_count=%s, "
+                    "k_before in [%.3f, %.3f], k_after in [%.3f, %.3f]",
+                    bad_count,
+                    min_k_before,
+                    max_k_before,
+                    min_k_after,
+                    max_k_after,
+                )
+        except Exception as log_exc:
+            logger.error("[nc] failed to log debug info for non-finite dequantization: %s", log_exc)
+
+        raise RuntimeError(
+            "[nc] detected non-finite value after NC dequantization; aborting this training run"
+        )
+
     shard_out.copy_(deq_avg)
 
     if state.error_feedback:
