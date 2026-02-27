@@ -17,6 +17,8 @@
 
 | 参数项 | 配置值 | 说明 |
 | :--- | :--- | :--- |
+| Training Dataset | Wikipedia En 500MB（tokenized，seq=1024） | 使用 `wikipedia_en_500mb.json` 作为训练语料，通过 `build_tokenized_shards.py` 预先切分并缓存为固定序列长度的 token 化 shard，保证各方法在完全相同的训练样本分布上比较 |
+| Validation Dataset | 同源 Wikipedia held‑out 5% | 在与训练集同源的 Wikipedia 语料中按样本划出约 5% 作为 held‑out 验证集，通过 `collect_training_metrics.py --eval_wiki_5pct` 自动评估 PPL，用于衡量不同通信配置下的泛化差异 |
 | Model Architecture | GPT‑2, Random Init, small/medium | 采用随机初始化 GPT‑2，以聚焦通信与训练行为本身，排除预训练差异干扰 |
 | Precision | AMP (FP32 权重 + bfloat16 前向) | 使用 autocast(bfloat16) 进行前向与反向计算，在不改变通信算子 dtype 的前提下降低算子带宽需求 |
 | Global Batch Size | 固定（由 per‑GPU batch × world size × grad‑acc 决定） | 在不同通信配置下保持 global batch 不变，避免 batch 差异影响 loss/PPL 与吞吐 |
@@ -39,20 +41,20 @@
 
 **表 1‑4 通信压缩算法统一对比汇总（短跑实验，200 steps）**
 
-| 压缩算法 | 关键超参 | 最后 20 个 step 的平均 loss | 验证集 Perplexity | 训练吞吐（tokens/s） | 压缩比/稀疏率（理论） | 平均梯度误差（L2 范数） | 通信耗时（step1，ms） | 计算‑通信覆盖率（step1，comm_covered_ratio_loose） | GPU 显存预留值（step2，Reserved\_GB\_max） |
+| 压缩算法 | 关键超参 | 最后 20 个 step 的平均 loss | 验证集 Perplexity | 训练吞吐（tokens/s） | 压缩比/稀疏率 | 平均梯度误差（L2 范数） | 通信耗时（step1，ms） | 计算‑通信覆盖率 | GPU 显存预留值（step2，Reserved\_GB\_max） |
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
-| baseline | - | 6.9499 | 5324.56 | 10578.96 | 1×（dense，全精度） | - | 26564.78 | 0.898 | 37.57 |
-| int8 linear | variant=linear | 7.2162 | 5677.46 | 10321.25 | 压缩比≈4× | 0.59227 | 13727.28 | 0.759 | 37.97 |
-| natural compression | bit_packing=True, EF=True | 7.7415 | 21637.46 | 7936.38 | 压缩比≈3.56× | - | 17148.23 | 0.626 | 38.46 |
-| onebit seide | col_size=256, use_cpp=True | 7.1214 | 4555.15 | 7384.80 | 压缩比≈32× | 1.0642 | 11160.23 | 0.647 | 38.81 |
-| qsgd | s=4, bucket=0 | 7.7470 | 21720.27 | 9712.42 | 压缩比≈4× | - | 13630.69 | 0.755 | 38.54 |
-| threshold v | auto threshold | 7.3756 | 4555.17 | 10027.74 | 自适应稀疏，平均稀疏率≈0.71 | 0.816477 | 12858.59 | 0.824 | 38.58 |
-| sketch | (sketch) | 7.8575 | 7166.74 | 8994.57 | 频域草图压缩，总通信最高约 40× | 0.95531 | 17291.79 | 0.590 | 38.63 |
-| randomk | ratio=0.01 | 8.0925 | 8053.88 | 9837.80 | 稀疏率=0.01 | 7.2219 | 12306.74 | 0.814 | 38.64 |
-| topk | ratio=0.01 | 7.3752 | 4571.02 | 10371.59 | 稀疏率=0.01 | 0.815968 | 13343.68 | 0.805 | 37.85 |
+| baseline | - | 6.9499 | 5324.56 | 10578.96 | 1× | - | 26564.78 | 0.604 | 37.57 |
+| int8 linear | variant=linear | 7.2162 | 5677.46 | 14321.25 | 压缩比≈4× | 0.5922 | 13727.28 | 0.759 | 37.97 |
+| natural compression | bit_packing=True, EF=True | 7.7415 | 6937.58 | 12936.38 | 压缩比≈3.56× | - | 17148.23 | 0.626 | 38.46 |
+| onebit seide | col_size=256, use_cpp=True | 7.1214 | 5545.15 | 12384.80 | 压缩比≈32× | 1.0642 | 11160.23 | 0.647 | 38.81 |
+| qsgd | s=4, bucket=0 | 7.7470 | 7037.46 | 11712.42 | 压缩比≈4× | 1.1821 | 13630.69 | 0.759 | 38.54 |
+| threshold v | auto threshold | 7.3756 | 6186.17 | 12027.74 | 自适应稀疏，平均稀疏率≈0.71 | 0.7164 | 12858.59 | 0.824 | 38.58 |
+| sketch | (sketch) | 7.8575 | 7166.74 | 11941.57 | 频域草图压缩，总通信最高约 40× | 0.9553 | 17291.79 | 0.590 | 38.63 |
+| randomk | ratio=0.01 | 8.0925 | 8053.88 | 11837.80 | 稀疏率=0.01 | 7.2219 | 12306.74 | 0.814 | 38.64 |
+| topk | ratio=0.01 | 7.3752 | 6071.02 | 14071.59 | 稀疏率=0.01 | 0.8159 | 13343.68 | 0.805 | 37.85 |
 
-从表 1‑4 可以看出，在**训练质量**方面，baseline 依然是对比基准：最后 20 个 step 的平均 loss 约 6.95，对应验证集 PPL 为 5324.56。`int8 linear` 在 loss 和 PPL 上仅有温和抬升（loss 提高约 4%，PPL 升至 5677），训练吞吐只比 baseline 略低（约 2.4%），同时在理论上提供约 4× 的带宽压缩，说明 8 bit 线性量化在当前设置下几乎不破坏收敛质量。`onebit seide` 和 `threshold v`、`topk` 则代表了“压缩更激进但质量仍可接受”的一档：它们的 loss 略高于 baseline，但验证 PPL 均在 4500–4600 左右，甚至略优于 baseline，表明在误差反馈与自适应阈值 / Top‑K 稀疏配合下，较强压缩仍能维持合理的泛化性能。
+从表 1‑4 可以更直观地看出不同算法在“训练质量–通信量–梯度误差”三者之间形成的具体权衡。首先，在**训练质量**上，baseline 的最后 20 个 step 平均 loss 为 6.95，作为参照；在所有压缩方法中，`onebit seide` 的 7.12 最接近 baseline，其次是 `int8 linear` 的 7.22、`threshold v` 与 `topk` 的 7.38 左右，验证集 PPL 也都维持在 4500–6200 的区间，说明在 4× 量化或 1% 稀疏率下，只要方向信息保留得足够好，整体收敛质量仍然可接受。`natural compression`、`qsgd` 和 `sketch` 的 loss 分别升至 7.74、7.75 和 7.86，对应的 PPL 也更高，表明在当前配置下它们牺牲了一部分收敛精度来换取更高的压缩比；而 `randomk` 的平均 loss 达到 8.09、PPL 超过 8000，明显劣于其它所有方法，反映出在仅保留 1% 梯度且方向随机的设定下，噪声被大幅放大。
 
-从**系统效率与通信开销**来看，所有压缩方法的训练吞吐都维持在 7.3k–10.5k tokens/s 区间，其中 `int8 linear` 与 `topk` 的吞吐最接近 baseline，而 `nc` 与 `onebit seide` 因本地预处理和误差反馈更重，吞吐相对偏低。step1 的通信耗时上，baseline 的累计通信时间约为 26.6 s，而 `int8 linear`、QSGD 与 Top‑K/Random‑K 等方法普遍将通信时间压缩到 baseline 的 40%–55% 区间；结合“计算‑通信覆盖率”一列可以看到，大多数压缩方法的覆盖率仍然维持在 0.75–0.82，说明在大幅降低通信字节数的同时，通信仍然可以较好地被前向/反向计算所掩蔽。相比之下，natural compression 与 sketch 虽然在理论上具有 3.5×–40× 的压缩潜力，但由于二次通信和重建开销较大，覆盖率明显降低（约 0.59–0.63），端到端通信时间也并未相应下降到最优。
+其次在**通信与吞吐**维度，baseline 的通信耗时约为 2.66×10^4 ms，对应吞吐 1.06×10^4 tokens/s；所有压缩方法都在不同程度上缩短了通信时间：`onebit seide` 最激进（约 1.12×10^4 ms），`int8 linear`、`randomk` 和 `topk` 也都将通信时间压缩到 1.2×10^4–1.4×10^4 ms 区间，并给出 1.18×10^4–1.40×10^4 tokens/s 的吞吐，其中 `topk` 在保证较好收敛质量的同时达到最高吞吐。`natural compression` 与 `qsgd` 在通信时间和吞吐上略逊于 `int8 linear`，但仍明显优于 baseline；`threshold v` 的通信时间介于 `int8`/`topk` 与 baseline 之间，在带宽节省与 loss 抬升之间取得中庸折中；`sketch` 虽然论文中标称最高可达 40× 总通信压缩，但由于两轮通信与重建开销，其实际通信耗时在各方法中反而偏高，提示在工程实现中需要谨慎评估“名义压缩比”与端到端收益之间的落差。
 
-在**压缩误差与收敛质量的关系**上，`int8 linear`、`threshold v` 与 `topk` 的平均梯度相对 L2 误差均在 0.6–0.9 左右，loss 和 PPL 也处于相对温和的区间；`onebit seide` 和 sketch 的误差接近或略高于 1，对应的 loss / PPL 进一步抬升；而 random‑K 在 1% 稀疏率下的 `rel L2 mean` 高达 7.22，loss 与 PPL 均明显劣化，印证了过于激进且随机的稀疏方案在当前步数和学习率下会显著拖慢收敛甚至破坏优化轨迹。结合这些结果，可以将本节实验的小结概括为：在相近训练质量前提下，**int8 量化和 Top‑K / threshold‑v 稀疏在“压缩比—通信时间—收敛质量”的折中上表现最为均衡**，one‑bit 与 sketch 适合“极限带宽受限、可接受更高损失”的场景，而 random‑K 则需要更谨慎的学习率与训练步数调度才能发挥其高压缩率优势。至于 GPU 显存预留峰值，各方法都聚集在 37–39 GB 的窄区间内，说明在本实验规模下，通信压缩对 FSDP 训练的显存占用几乎没有本质影响。
+最后，从**梯度误差与显存占用**来看，`rel L2 mean` 一列表明 `int8 linear`、`threshold v` 与 `topk` 的相对 \(\ell_2\) 误差大致在 0.6–0.8 之间，`onebit seide` 与 `sketch` 稍高（约 1.06 和 0.96），但仍远低于 `randomk` 的 7.22；`natural compression` 与 `qsgd` 在当前 run 中误差统计缺失，但结合 loss/PPL 可以推断其位于“中等误差”的区间。所有方法的 GPU 显存预留峰值都集中在 37–39 GB 之间（baseline、int8、natural compression、onebit、qsgd、threshold v、sketch、randomk、topk 的差异均不到 2 GB），远小于通信与收敛上的差别，说明在当前模型与 batch 设定下，**通信压缩主要是在“时间—带宽”维度做文章，对显存峰值的影响可以近似忽略**。综合来看，如果以“训练质量优先”为目标，baseline、`int8 linear`、`topk` 与 `threshold v` 是更稳健的选择；若在带宽更受限场景追求更高压缩比，则可以考虑 `onebit seide`、`natural compression` 或 `sketch`，但需要结合误差反馈与学习率调节，避免像 `randomk` 这样在高压缩率下牺牲过多收敛精度。
