@@ -4,6 +4,7 @@ import torch
 import torch.distributed as dist
 
 from .common import _ensure_residual, logger
+from perf.comm_stats import add_bytes as _comm_add_bytes
 
 try:
     # C++ 实现的 1-bit Seide 辅助算子（如可用则优先使用）
@@ -236,6 +237,10 @@ def fsdp_onebit_seide_comm_hook(
     num_cols_tensor = torch.tensor(num_cols, device=g.device, dtype=torch.long)
     dist.all_reduce(num_cols_tensor, op=dist.ReduceOp.MAX, group=pg, async_op=False)
     num_cols = num_cols_tensor.item()
+
+    # 记录本次 all-gather 的通信字节数（按每个 rank 发送的 payload 估算）
+    per_rank_bytes = int(packed_bytes) + int(ab_per_rank) * g.element_size()
+    _comm_add_bytes(state, per_rank_bytes)
 
     # All-gather（这是主要的通信开销）
     if hasattr(dist, "all_gather_into_tensor"):

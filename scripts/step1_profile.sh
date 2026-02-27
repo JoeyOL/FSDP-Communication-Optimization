@@ -67,17 +67,17 @@ Step1: 一键启动耗时取证（torch.profiler + step wall time + overlap）
 EOF
 }
 
-DATA_PATH=""
+DATA_PATH="datasets/wikipedia_en_500mb.json"
 OUTPUT_DIR="/root/llama-7b/fsdp_output"
 RUN_NAME=""
-NPROC=1
+NPROC=2
 NNODES=1
 NODE_RANK=0
 MASTER_ADDR=""
 MASTER_PORT=29500
-MAX_STEPS=55
+MAX_STEPS=52
 DATASET_MAX_SAMPLES=0
-BATCH_SIZE=1
+BATCH_SIZE=8
 MAX_LENGTH=1024
 GRADIENT_ACCUMULATION_STEPS=1
 MODEL_SIZE="medium"

@@ -34,6 +34,11 @@ $BASE --comm_hook int8 --comm_int8_variant dynamic_tree
 
 ### 1-bit Seide
 
+首先要更新
+```bash
+export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6:$LD_PRELOAD
+```
+
 ```bash
 $BASE --comm_hook onebit_seide --comm_onebit_col_size 256 --comm_error_feedback
 ```

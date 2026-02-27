@@ -8,14 +8,19 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # 脚本名
-SCRIPT_NAME="step2_profile.sh"
+SCRIPT_NAME="step1_profile.sh"
 
 # 配置列表：每一行是「实验标签|step1 附加参数|step2 附加参数」
 # 可以仿照下面两行自行扩展更多配置。
 CONFIGS=(
+  # "baseline|--comm_hook none"
+  # "int8_linear|--comm_hook int8 --comm_int8_variant linear"
+  # "onebit_seide|--comm_hook onebit_seide --comm_onebit_col_size 256 --comm_error_feedback"
+  # "nc|--comm_hook nc --comm_error_feedback"
   # "qsgd|--comm_hook qsgd --comm_qsgd_s 4 --comm_qsgd_bucket_size 0 --comm_error_feedback"
+  # "topk|--comm_hook topk --comm_topk_ratio 0.01"
+  "randomk|--comm_hook randomk"
   "threshold_v|--comm_hook threshold_v --comm_threshold_v 0"
-  "sketch_two_round|--comm_hook sketch --comm_sketch_two_round"
   "sketch|--comm_hook sketch"
 )
 
