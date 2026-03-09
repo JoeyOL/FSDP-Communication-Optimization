@@ -17,6 +17,7 @@
 
 | 参数项 | 配置值 | 说明 |
 | :--- | :--- | :--- |
+| Experiment Environment | Ubuntu24.04, 2×A100 (40GB) | 实验环境操作系统与 GPU 硬件配置 |
 | Training Dataset | Wikipedia En 500MB（tokenized，seq=1024） | 使用 `wikipedia_en_500mb.json` 作为训练语料，通过 `build_tokenized_shards.py` 预先切分并缓存为固定序列长度的 token 化 shard，保证各方法在完全相同的训练样本分布上比较 |
 | Validation Dataset | 同源 Wikipedia held‑out 5% | 在与训练集同源的 Wikipedia 语料中按样本划出约 5% 作为 held‑out 验证集，通过 `collect_training_metrics.py --eval_wiki_5pct` 自动评估 PPL，用于衡量不同通信配置下的泛化差异 |
 | Model Architecture | GPT‑2, Random Init, small/medium | 采用随机初始化 GPT‑2，以聚焦通信与训练行为本身，排除预训练差异干扰 |
