@@ -132,7 +132,7 @@ def _qsgd_decode_chunk(buf: torch.Tensor, s: int, shard_size: int) -> tuple[floa
         val = torch.stack(val_list, dim=1).flatten()[:n].to(buf.device)
         sign = ((val >> level_bits) & 1).float()
         level = (val & ((1 << level_bits) - 1)).clamp(0, s).float()
-        scale = (1.0 - 2.0 * sign) * (norm / max(s, 1))
+        scale = (2.0 * sign - 1.0) * (norm / max(s, 1))
         shard = scale * level
     else:
         vals = []
@@ -146,7 +146,7 @@ def _qsgd_decode_chunk(buf: torch.Tensor, s: int, shard_size: int) -> tuple[floa
             v &= (1 << bits) - 1
             sign = (v >> level_bits) & 1
             level = min(v & level_mask, s)
-            vals.append((1 if sign == 0 else -1) * norm * (level / max(s, 1)))
+            vals.append((1 if sign == 1 else -1) * norm * (level / max(s, 1)))
         shard = torch.tensor(vals, dtype=torch.float32, device=buf.device)
     out = torch.zeros(shard_size, dtype=torch.float32, device=buf.device)
     out[: shard.numel()] = shard

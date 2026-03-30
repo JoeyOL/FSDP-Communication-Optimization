@@ -53,7 +53,10 @@ def _heavymix_topk_indices(sketch: torch.Tensor, d: int, width: int, depth: int,
     l = min(k - n_H, NH_indices.numel())
     if l <= 0:
         return H_indices[:k]
-    perm = torch.randperm(NH_indices.numel(), device=NH_indices.device)[:l]
+    # Deterministic seed so all ranks select the same random fill (merged_sketch is identical after all_reduce)
+    gen = torch.Generator(device=NH_indices.device)
+    gen.manual_seed(int(est_sq.sum().item() * 1e6) % (2**31))
+    perm = torch.randperm(NH_indices.numel(), device=NH_indices.device, generator=gen)[:l]
     rand_NH = NH_indices[perm]
     topk = torch.cat([H_indices, rand_NH], dim=0)
     if topk.numel() > k:
@@ -178,7 +181,9 @@ def fsdp_sketch_comm_hook(
         else:
             if do_log:
                 logger.info("[sketch] two_round: all_gather values (list) start")
-            all_vals = torch.cat(dist.all_gather(values_at_topk.contiguous(), group=pg), dim=0)
+            all_vals_list = [torch.empty_like(values_at_topk) for _ in range(world_size)]
+            dist.all_gather(all_vals_list, values_at_topk.contiguous(), group=pg)
+            all_vals = torch.cat(all_vals_list, dim=0)
         if do_log and g.device.type == "cuda":
             ev_after_round2_gather.record()
 

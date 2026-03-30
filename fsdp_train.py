@@ -330,8 +330,6 @@ def main():
     if dist.is_initialized():
         dist.barrier()
     
-    dist.barrier()
-    
     # 清理分布式训练
     # 清理分布式训练
     if dist.is_initialized():

@@ -9,6 +9,12 @@ import torch
 from torch.profiler import ProfilerActivity
 from torch.utils.tensorboard import SummaryWriter
 
+try:
+    from logger import logger
+except ImportError:
+    import logging
+    logger = logging.getLogger(__name__)
+
 
 
 _COMM_KEYWORDS = (

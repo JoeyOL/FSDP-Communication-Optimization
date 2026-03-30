@@ -71,7 +71,7 @@ def _nc_decode_codes(codes: torch.Tensor) -> torch.Tensor:
     codes_i = codes.to(torch.int32)
     zero = codes_i == 0
     k_stored = codes_i & 0xFF
-    sign = (codes_i >> 8).float() * 2 - 1  # 0 -> 1, 1 -> -1
+    sign = 1.0 - 2.0 * (codes_i >> 8).float()  # 0 -> 1, 1 -> -1
     exp = (k_stored.float() - _K_OFFSET).to(codes.device)
     val = torch.exp2(exp)
     return torch.where(zero, torch.zeros_like(val, device=codes.device), sign * val)

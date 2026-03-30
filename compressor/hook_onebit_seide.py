@@ -193,13 +193,11 @@ def fsdp_onebit_seide_comm_hook(
         logger.debug(f"[1bit_seide R{rank}] full_flat_grad reshaped: {original_shape} -> {g.shape}")
 
     if state.error_feedback:
-        # 确保 residual 的形状与当前 shard 匹配
-        # FSDP 会为不同大小的参数组调用 hook，所以 residual 需要按 shard 大小管理
-        if not hasattr(state, "residual") or state.residual.shape != g.shape:
-            # 如果 residual 不存在或形状不匹配，重新创建
-            state.residual = torch.zeros_like(g)
-        residual = state.residual
-        g = (g + residual).to(g.dtype)
+        residual, start, end = _ensure_residual(state, g, pg)
+        if start is None:
+            g = (g + residual).to(g.dtype)
+        else:
+            g[start:end] += residual
 
     numel = g.numel()
     col_size = min(state.col_size, numel)
@@ -283,19 +281,18 @@ def fsdp_onebit_seide_comm_hook(
 
     if state.error_feedback:
         full_reconstructed = full_sum / float(world_size)
-        # 确保维度匹配
-        if g.shape != full_reconstructed.shape:
-            logger.error(
-                f"[1bit_seide R{rank}] Shape mismatch: g.shape={g.shape}, full_reconstructed.shape={full_reconstructed.shape}, numel={numel}, full_sum.shape={full_sum.shape}, full_flat_grad.shape={full_flat_grad.shape}"
-            )
-            raise RuntimeError(
-                f"Shape mismatch in error feedback: g.shape={g.shape}, full_reconstructed.shape={full_reconstructed.shape}"
-            )
-        # 确保 residual 的形状正确（应该已经在上面初始化了）
-        if not hasattr(state, "residual") or state.residual.shape != g.shape:
-            state.residual = torch.zeros_like(g)
-        residual = state.residual
-        residual.copy_(g - full_reconstructed)
+        # 使用 _ensure_residual 管理的 residual 更新误差反馈
+        idx = getattr(state, "_ef_index", 1) - 1
+        res_list = getattr(state, "_ef_residual_list", None)
+        if idx >= 0 and res_list is not None and idx < len(res_list) and res_list[idx] is not None:
+            res = res_list[idx]
+            if getattr(state, "_ef_local", False):
+                ef_start = getattr(state, "_ef_shard_start", 0)
+                ef_end = getattr(state, "_ef_shard_end", 0)
+                if res.numel() == (ef_end - ef_start) and ef_end <= g.numel():
+                    res.copy_(g[ef_start:ef_end] - full_reconstructed[ef_start:ef_end])
+            elif res.numel() == g.numel():
+                res.copy_(g - full_reconstructed)
 
 
 __all__ = ["OneBitSeideState", "fsdp_onebit_seide_comm_hook"]
