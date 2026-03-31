@@ -15,3 +15,38 @@ models/
 # 其他杂项
 trash/
 .vscode/
+# ===== LaTeX 编译临时文件 =====
+*.aux
+*.bbl
+*.blg
+*.log
+*.out
+*.toc
+*.idx
+*.ind
+*.ilg
+*.ist
+*.glo
+*.gls
+*.glg
+*.thm
+*.toe
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.synctex(busy)
+*.pdfsync
+*.nav
+*.snm
+*.vrb
+missfont.log
+
+# LaTeX 生成的 PDF（保留源码，不跟踪编译产物）
+毕业论文（设计）LATAX模板/examples/hitbook/chinese/thesis.pdf
+
+# EPS 对应的占位 PDF（编译时自动生成）
+毕业论文（设计）LATAX模板/examples/hitbook/chinese/*.pdf
+毕业论文（设计）LATAX模板/examples/hitbook/chinese/figures/*.pdf
+!毕业论文（设计）LATAX模板/examples/hitbook/chinese/README.md
