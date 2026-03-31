@@ -15,7 +15,7 @@ from perf.comm_profiler import (
     step_begin,
     step_end,
 )
-from perf.comm_stats import snapshot as comm_snapshot, total_bytes as comm_total_bytes
+from perf.comm_stats import snapshot as comm_snapshot, total_bytes as comm_total_bytes, reset_step as comm_reset_step
 from perf.grad_error_stats import snapshot as grad_error_snapshot
 
 
@@ -83,12 +83,17 @@ def train_epoch_with_monitoring(model, dataloader, optimizer, scheduler, epoch, 
 
     optimizer.zero_grad()
     
+    # [B22 fix] 记录 epoch 开始时的累计通信字节数，epoch 结束时取差值
+    _bytes_at_epoch_start = comm_total_bytes()
+
     # 使用 disable 参数，确保只有 rank0 打印进度条
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=(rank != 0), dynamic_ncols=True)
     
     step_count = 0
 
     for batch_idx, batch in enumerate(progress_bar):
+        # [B23 fix] 重置 per-step 计数器
+        comm_reset_step()
         # epoch 传入为 1-based，这里换算为 0-based 以保证 max_steps 计数准确
         global_step = (epoch - 1) * num_batches + batch_idx
         step_t0 = step_begin(monitor, args)
@@ -188,7 +193,9 @@ def train_epoch_with_monitoring(model, dataloader, optimizer, scheduler, epoch, 
     if rank == 0:
         try:
             hooks = comm_snapshot()
-            total_bytes = int(comm_total_bytes())
+            # [B22 fix] 使用本 epoch 的增量字节数，而非全生命周期累计值
+            total_bytes_now = int(comm_total_bytes())
+            total_bytes = max(0, total_bytes_now - _bytes_at_epoch_start)
             effective_steps = max(1, step_count)
             bytes_per_step = int(total_bytes / effective_steps)
             log_dir = Path(getattr(args, "output_dir", "/root/llama-7b/fsdp_output")) / "logs" / getattr(

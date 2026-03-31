@@ -4,17 +4,25 @@ from typing import Any, Dict, List
 
 @dataclass
 class GradErrorStats:
-    """Lightweight gradient compression error statistics, aggregated per comm hook."""
+    """Lightweight gradient compression error statistics, aggregated per comm hook.
+
+    [B19 enhancement] Now also tracks max and sum-of-squares for variance/std computation.
+    """
 
     name: str
     rel_l2_last: float = 0.0
     rel_l2_sum: float = 0.0
+    rel_l2_max: float = 0.0
+    rel_l2_sum_sq: float = 0.0  # sum of squared values for variance
     samples: int = 0
 
     def add(self, rel_l2: float) -> None:
         v = float(rel_l2)
         self.rel_l2_last = v
         self.rel_l2_sum += v
+        self.rel_l2_sum_sq += v * v
+        if v > self.rel_l2_max:
+            self.rel_l2_max = v
         self.samples += 1
 
     @property
@@ -22,6 +30,20 @@ class GradErrorStats:
         if self.samples <= 0:
             return 0.0
         return float(self.rel_l2_sum / self.samples)
+
+    @property
+    def rel_l2_var(self) -> float:
+        """Population variance of relative L2 error."""
+        if self.samples <= 1:
+            return 0.0
+        mean = self.rel_l2_mean
+        return float(self.rel_l2_sum_sq / self.samples - mean * mean)
+
+    @property
+    def rel_l2_std(self) -> float:
+        """Population standard deviation of relative L2 error."""
+        v = self.rel_l2_var
+        return float(v ** 0.5) if v > 0 else 0.0
 
 
 _ALL_STATS: List[GradErrorStats] = []
@@ -53,6 +75,8 @@ def snapshot() -> List[Dict[str, float]]:
             "name": stats.name,
             "rel_l2_last": float(stats.rel_l2_last),
             "rel_l2_mean": float(stats.rel_l2_mean),
+            "rel_l2_max": float(stats.rel_l2_max),
+            "rel_l2_std": float(stats.rel_l2_std),
             "samples": int(stats.samples),
         }
         for stats in _ALL_STATS

@@ -114,6 +114,12 @@ def _summarize_profiler_comm_ops(prof: torch.profiler.profile) -> dict[str, Any]
         "comm_ratio_cuda": comm_ratio_cuda,
         "comm_ratio_cpu": comm_ratio_cpu,
         "comm_ops": comm_rows,
+        # [B20 note] comm_ratio_cuda/cpu are APPROXIMATE because key_averages()
+        # includes hierarchical record_function scopes (forward_pass, backward_pass)
+        # whose cuda_time_total double-counts inner kernel times. For accurate
+        # comm/compute overlap analysis, use perf.trace_overlap which operates on
+        # raw GPU kernel events from the Chrome trace.
+        "_note": "comm_ratio values are approximate; use trace_overlap for precise overlap analysis",
     }
 
 
@@ -260,7 +266,7 @@ def finalize_monitoring(
             if "Python replay stack is empty" not in msg:
                 raise
 
-    # 3) 写 epoch loss，并关闭 TB
+    # 2) 写 epoch loss，并关闭 TB
     if ctx.tb_writer is not None:
         avg_epoch_loss = total_loss / max(1, num_batches)
         ctx.tb_writer.add_scalar("Loss/epoch", avg_epoch_loss, epoch)

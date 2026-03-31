@@ -46,7 +46,13 @@ _STRICT_COMPUTE_KEYWORDS = (
     "rmsnorm",
     "softmax",
     "triton",
-    "fused",
+    # Note: removed generic "fused" — it matches nccl fused kernels (B16 fix).
+    # Use more specific patterns for fused compute kernels:
+    "fused_adam",
+    "fused_sgd",
+    "fused_bias",
+    "fused_dropout",
+    "fused_layer_norm",
 )
 
 
@@ -138,6 +144,10 @@ def _is_compute_event_loose(name: str) -> bool:
 def _is_compute_event_strict(name: str) -> bool:
     n = (name or "").lower()
     if any(k in n for k in _EXCLUDE_COMPUTE_KEYWORDS):
+        return False
+    # [B15 fix] Also exclude comm kernels from strict compute to prevent
+    # double-counting (e.g., nccl kernels with "fused" in the name).
+    if any(k in n for k in _COMM_NAME_KEYWORDS):
         return False
     return any(k in n for k in _STRICT_COMPUTE_KEYWORDS)
 

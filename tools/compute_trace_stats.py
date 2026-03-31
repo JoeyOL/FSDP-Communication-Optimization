@@ -48,13 +48,20 @@ def _compute_comm_total_bytes_per_step_per_rank(
         ag = (n * 2) if ef_ag else 0
         return rs + ag
     if hook == "int8":
-        rs = n * 1
+        # [B12 fix] linear variant: int8 (1B/elem); dynamic_tree variant: int32 (4B/elem)
+        # Default to linear (1B); caller can override via int8_variant config if needed
+        rs = n * 1  # conservative: linear branch
         ag = (n * 1) if ef_ag else 0
         return rs + ag
-    if hook in ("qsgd", "signsgd", "onebit"):
-        # reduce_scatter in float16 or low-bit; all_gather same if EF
+    if hook == "qsgd":
+        # reduce_scatter in float16 (non-low-bit path); all_gather same if EF
         rs = n * 2
         ag = (n * 2) if ef_ag else 0
+        return rs + ag
+    if hook in ("signsgd", "onebit"):
+        # [B11 fix] SignSGD now transmits signs as int8 (1 byte/elem), not float16
+        rs = n * 1
+        ag = (n * 1) if ef_ag else 0
         return rs + ag
     if hook == "nc":
         if nc_bit_packing:

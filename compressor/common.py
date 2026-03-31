@@ -94,9 +94,10 @@ def _all_gather_shard(
     else:
         chunks = list(full.chunk(world_size, dim=0))
         dist.all_gather(chunks, shard, group=group)
-    # 近似统计：每个 rank 获得 full.numel() 元素作为 all_gather 负载
+    # [B10 fix] 统计口径：每 rank 发送量 = shard 大小（与其他 hook 保持一致）
+    # all_gather 中每个 rank 发送 shard_size 个元素，接收 full_size 个元素
     try:
-        _comm_add_bytes(state, full.numel() * full.element_size())
+        _comm_add_bytes(state, shard.numel() * shard.element_size())
     except Exception:
         pass
     if do_log:

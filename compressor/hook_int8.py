@@ -84,6 +84,12 @@ def fsdp_quantized_comm_hook(
     # Launch all_reduce asynchronously so we can overlap with other computation
     ar_handle = dist.all_reduce(global_max, op=dist.ReduceOp.MAX, group=pg, async_op=True)
 
+    # [B3 fix] 统计 all_reduce(global_max) 的通信量：1 个 float32 = 4 bytes
+    try:
+        _comm_add_bytes(state, 4)
+    except Exception:
+        pass
+
     if getattr(state, "variant", "linear") == "dynamic_tree":
         # --- dynamic_tree branch ---
         # While all_reduce is in flight, pre-compute sign and absolute values
@@ -119,8 +125,9 @@ def fsdp_quantized_comm_hook(
                     temp_shard_level, chunks, op=dist.ReduceOp.SUM, group=pg
                 )
 
+            # [B2 fix] 统计 reduce_scatter 发送量：完整 signed_level（numel 个 int32），不是 shard
             try:
-                _comm_add_bytes(state, temp_shard_level.numel() * temp_shard_level.element_size())
+                _comm_add_bytes(state, signed_level.numel() * signed_level.element_size())
             except Exception:
                 pass
 
@@ -129,13 +136,6 @@ def fsdp_quantized_comm_hook(
             shard_out.copy_(deq_avg)
     else:
         # --- linear branch ---
-        # While all_reduce is in flight, we can pre-compute the rounded tensor
-        # using local_max as a preliminary scale. After all_reduce completes,
-        # we rescale if global_max differs.
-        #
-        # However, since quantize + clamp depends on the final scale, the safest
-        # approach is to overlap the all_reduce with any other preparatory work
-        # (e.g., allocating output buffer), then quantize after wait().
         shard_size = numel // world_size
         temp_shard_out = torch.empty(shard_size, device=g.device, dtype=torch.int8)
 
@@ -152,8 +152,9 @@ def fsdp_quantized_comm_hook(
             chunks = list(q_grad.chunk(world_size, dim=0))
             dist.reduce_scatter(temp_shard_out, chunks, op=dist.ReduceOp.SUM, group=pg)
 
+        # [B1 fix] 统计 reduce_scatter 发送量：完整 q_grad（numel 个 int8），不是 shard
         try:
-            _comm_add_bytes(state, temp_shard_out.numel() * temp_shard_out.element_size())
+            _comm_add_bytes(state, q_grad.numel() * q_grad.element_size())
         except Exception:
             pass
         deq_sum = temp_shard_out.float() / scale
