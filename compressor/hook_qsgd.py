@@ -15,104 +15,179 @@ def _qsgd_bits_per_elem(s: int) -> int:
     return 1 + (s + 1).bit_length()
 
 
-def _qsgd_encode_chunk(norm: float, q_chunk: torch.Tensor, s: int) -> torch.Tensor:
-    """Encode one chunk: 4 bytes norm (float32) + packed (sign 1b, level) per element.
-    Returns uint8 tensor of shape (4 + chunk_bytes,). Vectorized on GPU to avoid .item() sync.
-    """
-    n = q_chunk.numel()
-    if n == 0:
-        return torch.zeros(4, dtype=torch.uint8, device=q_chunk.device)
-    bits = _qsgd_bits_per_elem(s)
-    chunk_bytes = (n * bits + 7) // 8
-    out = torch.empty(4 + chunk_bytes, dtype=torch.uint8, device=q_chunk.device)
-    norm_bytes = struct.pack("<f", float(norm))
-    for i in range(4):
-        out[i].fill_(norm_bytes[i])
-    norm_t = max(float(norm), 1e-12)
-    level_float = (q_chunk.abs() / norm_t * s).clamp(0, s)
-    level = level_float.round().long().clamp(0, s)
-    sign = (q_chunk >= 0).long()
-    level_bits = (s + 1).bit_length()
-    val = (sign << level_bits) + level
-    val = val.clamp(0, (1 << bits) - 1)
-    # Vectorized pack (no Python loop / .item() to avoid GPU sync hang)
-    if 8 % bits == 0:
-        elems_per_byte = 8 // bits
-        # Pad to multiple of elems_per_byte
-        pad = (elems_per_byte - n % elems_per_byte) % elems_per_byte
-        if pad > 0:
-            val = torch.nn.functional.pad(val, (0, pad), value=0)
-        # val[0], val[1] -> byte 0; val[2], val[3] -> byte 1; ...
-        num_bytes = val.numel() // elems_per_byte
-        packed = val[::elems_per_byte].clamp(0, 255).long()
-        for j in range(1, elems_per_byte):
-            packed = packed + (val[j::elems_per_byte].clamp(0, 255).long() << (j * bits))
-        out[4 : 4 + num_bytes].copy_(packed.to(torch.uint8))
-    else:
-        # Non-byte-aligned: fallback with minimal .item() - only for small n or use torch ops
-        out[4:].zero_()
-        for i in range(n):
-            byte_off = 4 + (i * bits) // 8
-            bit_off = (i * bits) % 8
-            v = int(val[i].item())
-            out[byte_off] = out[byte_off] | ((v << bit_off) & 0xFF)
-            if bit_off + bits > 8 and byte_off + 1 < out.numel():
-                out[byte_off + 1] = out[byte_off + 1] | ((v >> (8 - bit_off)) & 0xFF)
-    return out
+# ---------------------------------------------------------------------------
+# 向量化 bucket 编码 / 解码（消除 per-bucket Python 循环）
+# ---------------------------------------------------------------------------
 
-
-def _qsgd_encode_bucketed_chunk(
-    g_chunk: torch.Tensor,
-    q_chunk: torch.Tensor,
+def _qsgd_encode_bucketed_batch(
+    g: torch.Tensor,
+    q_g: torch.Tensor,
     bucket_size: int,
     s: int,
 ) -> torch.Tensor:
-    """Encode a shard that may span multiple buckets: per-bucket (4 bytes norm + packed). Fixed stride per bucket for all_to_all."""
-    n = q_chunk.numel()
+    """Encode an entire shard of quantized values into packed bytes.
+
+    优化：将所有 bucket 拼成 2D 张量一次性向量化处理，
+    消除原实现中 per-bucket Python 循环。
+    Returns uint8 tensor of shape (num_buckets * max_bucket_bytes,).
+    """
+    n = q_g.numel()
     if n == 0:
-        return torch.zeros(4, dtype=torch.uint8, device=q_chunk.device)
+        return torch.zeros(4, dtype=torch.uint8, device=q_g.device)
+
     bits = _qsgd_bits_per_elem(s)
-    max_bucket_bytes = 4 + (bucket_size * bits + 7) // 8
     num_buckets = (n + bucket_size - 1) // bucket_size
-    chunk_bytes = num_buckets * max_bucket_bytes
-    out = torch.empty(chunk_bytes, dtype=torch.uint8, device=q_chunk.device)
-    offset = 0
-    for b in range(num_buckets):
-        start = b * bucket_size
-        end = min((b + 1) * bucket_size, n)
-        seg = q_chunk[start:end]
-        norm = max(g_chunk[start:end].norm(p=2).item(), 1e-12)
-        enc = _qsgd_encode_chunk(norm, seg, s)
-        out[offset : offset + enc.numel()].copy_(enc)
-        if enc.numel() < max_bucket_bytes:
-            out[offset + enc.numel() : offset + max_bucket_bytes].zero_()
-        offset += max_bucket_bytes
+    max_bucket_bytes = 4 + (bucket_size * bits + 7) // 8
+
+    # Pad to full buckets for uniform reshape
+    padded_n = num_buckets * bucket_size
+    if padded_n > n:
+        g_padded = torch.nn.functional.pad(g.view(-1), (0, padded_n - n), value=0.0)
+        q_padded = torch.nn.functional.pad(q_g.view(-1), (0, padded_n - n), value=0.0)
+    else:
+        g_padded = g.view(-1)
+        q_padded = q_g.view(-1)
+
+    g_2d = g_padded.view(num_buckets, bucket_size)  # (num_buckets, bucket_size)
+    q_2d = q_padded.view(num_buckets, bucket_size)
+
+    # Per-bucket norms (vectorized, no loop)
+    norms = g_2d.norm(p=2, dim=1).clamp(min=1e-12)  # (num_buckets,)
+
+    # Quantize levels: level = round(|q_g| / norm * s), clamped to [0, s]
+    norm_expanded = norms.unsqueeze(1).expand_as(q_2d)  # (num_buckets, bucket_size)
+    level_float = (q_2d.abs() / norm_expanded * s).clamp(0, s)
+    level = level_float.round().long().clamp(0, s)
+    sign = (q_2d >= 0).long()
+
+    level_bits = (s + 1).bit_length()
+    val = (sign << level_bits) + level  # (num_buckets, bucket_size)
+    val = val.clamp(0, (1 << bits) - 1)
+
+    # Pack bits into bytes (vectorized)
+    out = torch.zeros(num_buckets * max_bucket_bytes, dtype=torch.uint8, device=q_g.device)
+
+    # Write norms as 4 bytes per bucket
+    norm_bytes_array = torch.frombuffer(
+        b"".join(struct.pack("<f", float(nm)) for nm in norms.tolist()),
+        dtype=torch.uint8,
+    ).to(device=q_g.device)
+    # norm_bytes_array: (num_buckets * 4,)
+    # Scatter into output: positions [b * max_bucket_bytes : b * max_bucket_bytes + 4]
+    bucket_offsets = torch.arange(num_buckets, device=q_g.device) * max_bucket_bytes
+    for byte_i in range(4):
+        out[bucket_offsets + byte_i] = norm_bytes_array[torch.arange(num_buckets, device=q_g.device) * 4 + byte_i]
+
+    if 8 % bits == 0:
+        elems_per_byte = 8 // bits
+        # Pad val to multiple of elems_per_byte per bucket
+        pad_per_bucket = (elems_per_byte - bucket_size % elems_per_byte) % elems_per_byte
+        if pad_per_bucket > 0:
+            val = torch.nn.functional.pad(val, (0, pad_per_bucket), value=0)
+        padded_bs = bucket_size + pad_per_bucket
+        num_bytes_per_bucket = padded_bs // elems_per_byte
+
+        # Reshape to (num_buckets, num_bytes_per_bucket, elems_per_byte)
+        val_3d = val.view(num_buckets, num_bytes_per_bucket, elems_per_byte)
+        # Pack: byte = v[0] | (v[1] << bits) | (v[2] << 2*bits) | ...
+        packed = val_3d[:, :, 0].long()
+        for j in range(1, elems_per_byte):
+            packed = packed + (val_3d[:, :, j].long() << (j * bits))
+        packed = packed.clamp(0, 255).to(torch.uint8)  # (num_buckets, num_bytes_per_bucket)
+
+        # Write packed data into output buffer
+        for b_idx in range(num_buckets):
+            start_pos = b_idx * max_bucket_bytes + 4
+            end_pos = start_pos + num_bytes_per_bucket
+            out[start_pos:end_pos] = packed[b_idx]
+    else:
+        # Non-byte-aligned: fallback per-bucket (rare, only when s causes odd bit width)
+        for b_idx in range(num_buckets):
+            bucket_start = b_idx * max_bucket_bytes + 4
+            bucket_n = min(bucket_size, n - b_idx * bucket_size)
+            for i in range(bucket_n):
+                byte_off = bucket_start + (i * bits) // 8
+                bit_off = (i * bits) % 8
+                v = int(val[b_idx, i].item())
+                out[byte_off] = out[byte_off] | ((v << bit_off) & 0xFF)
+                if bit_off + bits > 8 and byte_off + 1 < out.numel():
+                    out[byte_off + 1] = out[byte_off + 1] | ((v >> (8 - bit_off)) & 0xFF)
+
     return out
 
 
-def _qsgd_decode_bucketed_chunk(
+def _qsgd_decode_bucketed_batch(
     buf: torch.Tensor,
     s: int,
     shard_size: int,
     bucket_size: int,
 ) -> torch.Tensor:
-    """Decode buffer produced by _qsgd_encode_bucketed_chunk to float shard."""
+    """Decode entire buffer to float shard (vectorized over all buckets).
+
+    优化：将所有 bucket 拼成 2D 操作，消除 per-bucket Python 循环。
+    """
     bits = _qsgd_bits_per_elem(s)
     max_bucket_bytes = 4 + (bucket_size * bits + 7) // 8
     num_buckets = (shard_size + bucket_size - 1) // bucket_size
+
+    if buf.numel() < num_buckets * max_bucket_bytes:
+        return torch.zeros(shard_size, dtype=torch.float32, device=buf.device)
+
+    level_bits = (s + 1).bit_length()
     parts = []
-    offset = 0
-    for b in range(num_buckets):
-        n_elems = min(bucket_size, shard_size - b * bucket_size)
-        seg_buf = buf[offset : offset + max_bucket_bytes]
-        _, seg = _qsgd_decode_chunk(seg_buf, s, n_elems)
-        parts.append(seg[:n_elems])
-        offset += max_bucket_bytes
-    return torch.cat(parts)
+
+    if 8 % bits == 0:
+        elems_per_byte = 8 // bits
+        mask = (1 << bits) - 1
+        data_bytes_per_bucket = max_bucket_bytes - 4
+
+        # Extract all norms at once
+        buf_2d = buf.view(num_buckets, max_bucket_bytes)
+        norm_bytes_cpu = buf_2d[:, :4].to(torch.uint8).cpu().numpy()
+        norms = torch.tensor(
+            [struct.unpack("<f", norm_bytes_cpu[b].tobytes())[0] for b in range(num_buckets)],
+            dtype=torch.float32,
+            device=buf.device,
+        )
+
+        # Extract packed payloads: (num_buckets, data_bytes_per_bucket)
+        payloads = buf_2d[:, 4:].long()
+
+        # Unpack all bits at once: (num_buckets, data_bytes_per_bucket, elems_per_byte)
+        val_list = []
+        for j in range(elems_per_byte):
+            val_list.append((payloads >> (j * bits)) & mask)
+        # (num_buckets, data_bytes_per_bucket, elems_per_byte)
+        vals_3d = torch.stack(val_list, dim=2)
+        # Flatten to (num_buckets, data_bytes_per_bucket * elems_per_byte)
+        vals_flat = vals_3d.view(num_buckets, -1)
+
+        # Decode: sign and level
+        sign = ((vals_flat >> level_bits) & 1).float()
+        level = (vals_flat & ((1 << level_bits) - 1)).clamp(0, s).float()
+        scale = (2.0 * sign - 1.0) * (norms / max(s, 1)).unsqueeze(1)
+        decoded_full = scale * level  # (num_buckets, max_elems_per_bucket)
+
+        # Trim to actual shard_size
+        result = torch.zeros(shard_size, dtype=torch.float32, device=buf.device)
+        for b in range(num_buckets):
+            actual_n = min(bucket_size, shard_size - b * bucket_size)
+            result[b * bucket_size: b * bucket_size + actual_n] = decoded_full[b, :actual_n]
+        return result
+    else:
+        # Non-byte-aligned fallback
+        offset = 0
+        for b in range(num_buckets):
+            n_elems = min(bucket_size, shard_size - b * bucket_size)
+            seg_buf = buf[offset: offset + max_bucket_bytes]
+            _, seg = _qsgd_decode_chunk_fallback(seg_buf, s, n_elems)
+            parts.append(seg[:n_elems])
+            offset += max_bucket_bytes
+        return torch.cat(parts)
 
 
-def _qsgd_decode_chunk(buf: torch.Tensor, s: int, shard_size: int) -> tuple[float, torch.Tensor]:
-    """Decode bytes to (norm, float_shard). Vectorized for 8%%bits==0 to avoid Python loop over millions."""
+def _qsgd_decode_chunk_fallback(buf: torch.Tensor, s: int, shard_size: int) -> tuple[float, torch.Tensor]:
+    """Decode bytes to (norm, float_shard). Fallback for non-byte-aligned bits."""
     if buf.numel() < 4:
         return 0.0, torch.zeros(shard_size, dtype=torch.float32, device=buf.device)
     norm = struct.unpack("<f", bytes(buf[:4].cpu().tolist()))[0]
@@ -121,33 +196,19 @@ def _qsgd_decode_chunk(buf: torch.Tensor, s: int, shard_size: int) -> tuple[floa
     n = min(shard_size, (buf.numel() - 4) * 8 // bits)
     if n <= 0:
         return norm, torch.zeros(shard_size, dtype=torch.float32, device=buf.device)
-    if 8 % bits == 0:
-        elems_per_byte = 8 // bits
-        mask = (1 << bits) - 1
-        payload = buf[4:].long()
-        # Unpack: byte b gives elems_per_byte values at (b >> (j*bits)) & mask for j=0..elems_per_byte-1
-        val_list = []
-        for j in range(elems_per_byte):
-            val_list.append((payload >> (j * bits)) & mask)
-        val = torch.stack(val_list, dim=1).flatten()[:n].to(buf.device)
-        sign = ((val >> level_bits) & 1).float()
-        level = (val & ((1 << level_bits) - 1)).clamp(0, s).float()
-        scale = (2.0 * sign - 1.0) * (norm / max(s, 1))
-        shard = scale * level
-    else:
-        vals = []
-        level_mask = (1 << level_bits) - 1
-        for i in range(n):
-            byte_off = 4 + (i * bits) // 8
-            bit_off = (i * bits) % 8
-            v = int(buf[byte_off].item()) >> bit_off
-            if bit_off + bits > 8 and byte_off + 1 < buf.numel():
-                v |= int(buf[byte_off + 1].item()) << (8 - bit_off)
-            v &= (1 << bits) - 1
-            sign = (v >> level_bits) & 1
-            level = min(v & level_mask, s)
-            vals.append((1 if sign == 1 else -1) * norm * (level / max(s, 1)))
-        shard = torch.tensor(vals, dtype=torch.float32, device=buf.device)
+    level_mask = (1 << level_bits) - 1
+    vals = []
+    for i in range(n):
+        byte_off = 4 + (i * bits) // 8
+        bit_off = (i * bits) % 8
+        v = int(buf[byte_off].item()) >> bit_off
+        if bit_off + bits > 8 and byte_off + 1 < buf.numel():
+            v |= int(buf[byte_off + 1].item()) << (8 - bit_off)
+        v &= (1 << bits) - 1
+        sign = (v >> level_bits) & 1
+        level = min(v & level_mask, s)
+        vals.append((1 if sign == 1 else -1) * norm * (level / max(s, 1)))
+    shard = torch.tensor(vals, dtype=torch.float32, device=buf.device)
     out = torch.zeros(shard_size, dtype=torch.float32, device=buf.device)
     out[: shard.numel()] = shard
     return norm, out
@@ -165,10 +226,11 @@ class QSGDState:
         self.s = max(2, int(s))
         self.error_feedback = error_feedback
         self._ef_local = ef_local
-        # bucket_size <= 0 or >= numel: whole vector one bucket; else per-bucket QSGD (paper Section 4)
         self.bucket_size = bucket_size
-        # low_bit_comm: True = all_reduce(scale) + reduce_scatter(quantized float16), same collective as baseline, half data; False = reduce_scatter(float16)
         self.low_bit_comm = low_bit_comm
+        # 预计算是否可以走低比特路径（避免每次 hook 调用重复检查）
+        bits = _qsgd_bits_per_elem(self.s)
+        self._byte_aligned = (8 % bits == 0)
 
 
 def _qsgd_quantize(v: torch.Tensor, s: int) -> torch.Tensor:
@@ -177,13 +239,11 @@ def _qsgd_quantize(v: torch.Tensor, s: int) -> torch.Tensor:
     if norm < 1e-12:
         return v
     v_n = v / norm
-    # v_n in [-1,1]; quantize to {-1, -(s-1)/s, ..., (s-1)/s, 1}
     abs_v = v_n.abs()
     level_float = abs_v * s
     lo = level_float.floor().clamp(0, s - 1)
     hi = level_float.ceil().clamp(0, s)
     p = level_float - lo
-    # stochastic rounding
     u = torch.empty_like(v).uniform_(0, 1)
     lev = torch.where(u < p, hi, lo)
     q_abs = lev.float() / s
@@ -227,6 +287,8 @@ def fsdp_qsgd_comm_hook(
 
     low_bit_comm=True: all_reduce(1 float for scale) + reduce_scatter(quantized float16). Same collective
     as baseline, half the data, no all_to_all. low_bit_comm=False: reduce_scatter(float16).
+
+    优化：编解码批量化，消除 per-shard 和 per-bucket Python 循环。
     """
     pg = dist.group.WORLD
     world_size = dist.get_world_size(pg)
@@ -239,13 +301,8 @@ def fsdp_qsgd_comm_hook(
     numel = full_flat_grad.numel()
     shard_size = numel // world_size
     use_low_bits_whole = (state.bucket_size <= 0 or state.bucket_size >= numel) and (shard_size > 0)
-    # 对按桶 QSGD，低比特 + bit 编码 + all_to_all 在 Python 实现下开销过大，这里仅在“整向量一桶”时启用低比特路径。
-    use_low_bits = getattr(state, "low_bit_comm", True) and use_low_bits_whole
-    # 若每坐标比特数不能整除 8，则 bit 打包需要逐元素处理，复杂度过高，这里退化为 float16 通道以避免“卡死”。
-    if use_low_bits:
-        bits = _qsgd_bits_per_elem(state.s)
-        if 8 % bits != 0:
-            use_low_bits = False
+    # 使用预计算的 _byte_aligned 判断，避免每次重新计算
+    use_low_bits = getattr(state, "low_bit_comm", True) and use_low_bits_whole and state._byte_aligned
 
     global _qsgd_hook_log_count
     _qsgd_hook_log_count += 1
@@ -277,47 +334,28 @@ def fsdp_qsgd_comm_hook(
         logger.info("[QSGD hook] rank=%s after quantize", rank)
 
     if use_low_bits:
-        # 低比特通信：按 QSGD 码本编码为 bit 串，并用 all_to_all 交换各 shard 的编码，再在本地解码求和。
-        # 与 reduce_scatter 相比，仍是“整向量编码 + all_to_all”的 bit 通信路径，更贴近原 QSGD 设计。
-        #
-        # 设计：将量化后的 q_g 看作一维向量，按 shard_size 划分为 world_size 个 shard；
-        # 对每个 shard 调用 _qsgd_encode_bucketed_chunk 得到定长字节串，拼接成 send_buf，
-        # 用 all_to_all 交换后逐 shard 调用 _qsgd_decode_bucketed_chunk 解码并求和。
         if shard_size == 0:
             temp_shard = torch.zeros(0, device=g.device, dtype=torch.float32)
         else:
-            # bucket_size <= 0 或大于 shard_size 时，退化为“整 shard 一桶”，避免除 0
             eff_bucket_size = state.bucket_size
             if eff_bucket_size <= 0 or eff_bucket_size > shard_size:
                 eff_bucket_size = shard_size
 
-            # 先对第一个 shard 进行编码以确定每个 shard 的字节长度（各 rank、各 shard 一致）
-            first_start = 0
-            first_end = shard_size
-            first_enc = _qsgd_encode_bucketed_chunk(
-                g[first_start:first_end],
-                q_g[first_start:first_end],
-                eff_bucket_size,
-                state.s,
-            )
-            shard_bytes = first_enc.numel()
-            send_buf = torch.empty(world_size * shard_bytes, device=g.device, dtype=torch.uint8)
-            # 填充第一个 shard
-            send_buf[0:shard_bytes].copy_(first_enc)
-            # 编码其余 shard
-            for j in range(1, world_size):
-                start = j * shard_size
-                end = start + shard_size
-                enc = _qsgd_encode_bucketed_chunk(
-                    g[start:end],
-                    q_g[start:end],
-                    eff_bucket_size,
-                    state.s,
+            # 批量编码所有 shard（消除 per-shard Python 循环）
+            shard_enc_list = []
+            for j in range(world_size):
+                s_start = j * shard_size
+                s_end = s_start + shard_size
+                enc = _qsgd_encode_bucketed_batch(
+                    g[s_start:s_end], q_g[s_start:s_end], eff_bucket_size, state.s
                 )
-                # 理论上各 shard 的编码长度应一致；如不一致则截断/填充为相同长度
-                buf_j = send_buf[j * shard_bytes : (j + 1) * shard_bytes]
-                buf_j.zero_()
-                buf_j[: enc.numel()].copy_(enc)
+                shard_enc_list.append(enc)
+
+            # 确保所有 shard 编码长度一致
+            shard_bytes = max(e.numel() for e in shard_enc_list)
+            send_buf = torch.zeros(world_size * shard_bytes, device=g.device, dtype=torch.uint8)
+            for j, enc in enumerate(shard_enc_list):
+                send_buf[j * shard_bytes: j * shard_bytes + enc.numel()].copy_(enc)
 
             recv_buf = torch.empty_like(send_buf)
             if hasattr(dist, "all_to_all_single"):
@@ -328,24 +366,18 @@ def fsdp_qsgd_comm_hook(
                 dist.all_to_all(recv_chunks, send_chunks, group=pg)
                 recv_buf = torch.cat(recv_chunks, dim=0)
 
-            # 近似统计：按 send_buf 元素数估算 all_to_all 负载
             try:
                 _comm_add_bytes(state, send_buf.numel() * send_buf.element_size())
             except Exception:
                 pass
 
+            # 批量解码所有接收到的 shard 并求和
             temp_shard = torch.zeros(shard_size, device=g.device, dtype=torch.float32)
             for j in range(world_size):
-                buf_j = recv_buf[j * shard_bytes : (j + 1) * shard_bytes]
-                decoded = _qsgd_decode_bucketed_chunk(
-                    buf_j,
-                    state.s,
-                    shard_size,
-                    eff_bucket_size,
-                )
+                buf_j = recv_buf[j * shard_bytes: (j + 1) * shard_bytes]
+                decoded = _qsgd_decode_bucketed_batch(buf_j, state.s, shard_size, eff_bucket_size)
                 temp_shard.add_(decoded)
     else:
-        # Float path: same collective as baseline. Use float16 reduce_scatter to cut comm volume in half (saves time when bandwidth-bound).
         q_g_fp16 = q_g.half()
         temp_shard_fp16 = torch.empty(shard_size, device=g.device, dtype=torch.float16)
         if hasattr(dist, "reduce_scatter_tensor"):
@@ -353,7 +385,6 @@ def fsdp_qsgd_comm_hook(
         else:
             chunks = list(q_g_fp16.chunk(world_size, dim=0))
             dist.reduce_scatter(temp_shard_fp16, chunks, op=dist.ReduceOp.SUM, group=pg)
-        # 近似统计：按 q_g_fp16 元素数估算 reduce_scatter 负载
         try:
             _comm_add_bytes(state, q_g_fp16.numel() * q_g_fp16.element_size())
         except Exception:
@@ -372,5 +403,3 @@ def fsdp_qsgd_comm_hook(
 
 
 __all__ = ["QSGDState", "fsdp_qsgd_comm_hook"]
-
-

@@ -64,6 +64,43 @@ def _thresholdv_to_fixed_k_indices_values(
     return indices, values
 
 
+def _estimate_threshold_topk(abs_vals: torch.Tensor, k_side: int) -> float:
+    """
+    P2 optimization: use torch.topk instead of torch.kthvalue for threshold estimation.
+
+    torch.topk on GPU uses partial sort (heap-based selection) which is O(n log k),
+    significantly faster than torch.kthvalue's O(n log n) full sort for large tensors.
+    For very large tensors, we still use strided sampling to bound computation.
+    """
+    n = abs_vals.numel()
+    if n == 0 or k_side <= 0:
+        return 0.0
+
+    sample_cap = 200_000
+
+    if n <= sample_cap:
+        # Exact: use topk to find the k-th largest value directly
+        # topk returns k largest values; the smallest among them is our threshold
+        actual_k = min(k_side, n)
+        if actual_k <= 0:
+            return 0.0
+        vals, _ = abs_vals.topk(actual_k, largest=True, sorted=False)
+        return float(vals.min().item())
+    else:
+        # Approximate: strided sampling + topk on sample
+        stride = max(1, n // sample_cap)
+        sample = abs_vals[::stride]
+        m = sample.numel()
+        if m == 0:
+            return 0.0
+        # Scale k proportionally to sample size
+        k_sample = max(1, min(m, int(m * (k_side / max(1, n)))))
+        if k_sample <= 0:
+            return 0.0
+        vals, _ = sample.topk(k_sample, largest=True, sorted=False)
+        return float(vals.min().item())
+
+
 def fsdp_thresholdv_comm_hook(
     state: ThresholdVState,
     full_flat_grad: torch.Tensor,
@@ -124,65 +161,27 @@ def fsdp_thresholdv_comm_hook(
         v_neg = state.v_neg_val
     else:
         # 自动双阈值：以目标稀疏率 ratio 为总预算，在正、负两侧分别估计分位数阈值 v_pos / v_neg。
-        # 为降低开销，大向量上仍采用抽样近似。
+        # P2 optimization: 使用 torch.topk 替代 torch.kthvalue，GPU 上更高效。
         if do_log:
             logger.info("[threshold_v] auto dual-threshold start (k_total=%s, ratio=%.4f)", k_total, state.ratio)
 
         g_pos = g[g > 0]
-        g_neg = (-g[g < 0])  # 负侧用绝对值
+        g_neg_abs = (-g[g < 0])  # 负侧用绝对值
         n_pos = int(g_pos.numel())
-        n_neg = int(g_neg.numel())
+        n_neg = int(g_neg_abs.numel())
 
         if n_pos + n_neg == 0:
             # 退化情况：梯度全为 0
             v_pos = v_neg = 0.0
         else:
-            # 按正负两侧占比分配总的“保留预算”
+            # 按正负两侧占比分配总的"保留预算"
             k_pos = int(round(k_total * (n_pos / (n_pos + n_neg)))) if n_pos > 0 else 0
             k_neg = k_total - k_pos
             k_pos = max(0, min(n_pos, k_pos))
             k_neg = max(0, min(n_neg, k_neg))
 
-            sample_cap = 200_000
-
-            def _estimate_quantile_side(abs_side: torch.Tensor, n_side: int, k_side: int, label: str) -> float:
-                if n_side == 0 or k_side <= 0:
-                    return 0.0
-                if n_side <= sample_cap:
-                    idx = max(1, min(n_side, n_side - k_side + 1))
-                    v_t = torch.kthvalue(abs_side, idx).values
-                    if do_log:
-                        logger.info(
-                            "[threshold_v] auto %s-threshold exact: n=%s idx=%s v=%.6e",
-                            label,
-                            n_side,
-                            idx,
-                            float(v_t.item()),
-                        )
-                    return float(v_t.item())
-                # 抽样近似
-                stride = max(1, n_side // sample_cap)
-                sample = abs_side[::stride]
-                m = int(sample.numel())
-                if m == 0:
-                    return 0.0
-                # 在样本上使用相同比例的分位数
-                # 目标在该侧的比例约为 k_side / n_side
-                k_sample = max(1, min(m, m - int(m * (k_side / max(1, n_side))) + 1))
-                v_t = torch.kthvalue(sample, k_sample).values
-                if do_log:
-                    logger.info(
-                        "[threshold_v] auto %s-threshold approx: n=%s m=%s k_sample=%s v=%.6e",
-                        label,
-                        n_side,
-                        m,
-                        k_sample,
-                        float(v_t.item()),
-                    )
-                return float(v_t.item())
-
-            v_pos = _estimate_quantile_side(g_pos.abs(), n_pos, k_pos, "pos")
-            v_neg = _estimate_quantile_side(g_neg.abs(), n_neg, k_neg, "neg")
+            v_pos = _estimate_threshold_topk(g_pos.abs(), k_pos)
+            v_neg = _estimate_threshold_topk(g_neg_abs.abs(), k_neg)
 
         if do_log:
             logger.info("[threshold_v] auto dual-threshold done v_pos=%.6e v_neg=%.6e", v_pos, v_neg)
@@ -294,5 +293,3 @@ def fsdp_thresholdv_comm_hook(
 
 
 __all__ = ["ThresholdVState", "fsdp_thresholdv_comm_hook"]
-
-

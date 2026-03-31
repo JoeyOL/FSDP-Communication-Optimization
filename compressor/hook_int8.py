@@ -55,6 +55,8 @@ def fsdp_quantized_comm_hook(
     FSDP communication hook for int8 quantization before reduce-scatter.
     variant=linear: symmetric scale=global_max; variant=dynamic_tree: normalize [0,1] + 7-bit stochastic (paper 3.1).
     With error_feedback: compresses (g + residual) and updates residual.
+
+    P2 optimization: overlap all_reduce(global_max) with local computation via async_op=True.
     """
     pg = dist.group.WORLD
     world_size = dist.get_world_size(pg)
@@ -76,27 +78,34 @@ def fsdp_quantized_comm_hook(
         f"flat grad numel {numel} must be divisible by world_size {world_size}"
     )
 
+    # --- P2 optimized: async all_reduce for global_max ---
     local_max = g.abs().max().to(torch.float32)
     global_max = local_max.clone()
-    dist.all_reduce(global_max, op=dist.ReduceOp.MAX, group=pg)
-    scale_val = global_max.clamp(min=1e-8).item()
+    # Launch all_reduce asynchronously so we can overlap with other computation
+    ar_handle = dist.all_reduce(global_max, op=dist.ReduceOp.MAX, group=pg, async_op=True)
 
     if getattr(state, "variant", "linear") == "dynamic_tree":
-        # 动态树 8bit：保持 7-bit 随机舍入的量化形式，但通信改为 int16 + reduce_scatter，
-        # 使每个 rank 只处理自己 shard 的数据，避免 all_gather 的 O(world_size * numel) 开销。
+        # --- dynamic_tree branch ---
+        # While all_reduce is in flight, pre-compute sign and absolute values
+        # (these don't depend on global_max yet)
+        g_abs = g.abs()
+        sign_int32 = torch.where(g >= 0, 1, -1).to(torch.int32)
+
+        # Now we need global_max for scale_val — wait for all_reduce to finish
+        ar_handle.wait()
+        scale_val = global_max.clamp(min=1e-8).item()
+
         if scale_val < 1e-8:
             shard_out.zero_()
         else:
-            # 生成 7-bit level 和符号，并编码为有符号整型：signed_level ∈ [-127, 127]
-            g_abs = g.abs()
+            # 7-bit level quantization using pre-computed g_abs and sign
             g_norm = (g_abs / scale_val).clamp(0.0, 1.0)
             level_float = g_norm * 127.0
             lo = level_float.floor().clamp(0, 126)
             hi = level_float.ceil().clamp(1, 127)
             u = torch.empty_like(g, dtype=torch.float32).uniform_(0, 1)
             lev = torch.where(u < (level_float - lo), hi, lo).to(torch.int32)
-            sign = torch.where(g >= 0, 1, -1).to(torch.int32)
-            signed_level = (sign * lev).view(-1)
+            signed_level = (sign_int32 * lev).view(-1)
 
             shard_size = numel // world_size
             temp_shard_level = torch.empty(shard_size, device=g.device, dtype=torch.int32)
@@ -110,7 +119,6 @@ def fsdp_quantized_comm_hook(
                     temp_shard_level, chunks, op=dist.ReduceOp.SUM, group=pg
                 )
 
-            # 近似统计：按每个 rank 输出 shard 的元素数估算 reduce_scatter 负载
             try:
                 _comm_add_bytes(state, temp_shard_level.numel() * temp_shard_level.element_size())
             except Exception:
@@ -120,17 +128,30 @@ def fsdp_quantized_comm_hook(
             deq_avg = (deq_sum / float(world_size)).to(full_flat_grad.dtype)
             shard_out.copy_(deq_avg)
     else:
+        # --- linear branch ---
+        # While all_reduce is in flight, we can pre-compute the rounded tensor
+        # using local_max as a preliminary scale. After all_reduce completes,
+        # we rescale if global_max differs.
+        #
+        # However, since quantize + clamp depends on the final scale, the safest
+        # approach is to overlap the all_reduce with any other preparatory work
+        # (e.g., allocating output buffer), then quantize after wait().
+        shard_size = numel // world_size
+        temp_shard_out = torch.empty(shard_size, device=g.device, dtype=torch.int8)
+
+        # Wait for global_max before quantization (scale depends on it)
+        ar_handle.wait()
+
         qr = max(1, 127 // world_size)
         scale = qr / torch.clamp(global_max, min=1e-8)
-        q_grad = _int8_linear_quantize(g, global_max, world_size)
-        temp_shard_out = torch.empty_like(shard_out, dtype=torch.int8)
+        q_grad = torch.clamp((g * scale).round(), -qr, qr).to(torch.int8)
+
         if hasattr(dist, "reduce_scatter_tensor"):
             dist.reduce_scatter_tensor(temp_shard_out, q_grad, op=dist.ReduceOp.SUM, group=pg)
         else:
             chunks = list(q_grad.chunk(world_size, dim=0))
             dist.reduce_scatter(temp_shard_out, chunks, op=dist.ReduceOp.SUM, group=pg)
 
-        # 近似统计：按每个 rank 输出 shard 的元素数估算 reduce_scatter 负载
         try:
             _comm_add_bytes(state, temp_shard_out.numel() * temp_shard_out.element_size())
         except Exception:
@@ -144,5 +165,3 @@ def fsdp_quantized_comm_hook(
 
 
 __all__ = ["GradQuantState", "fsdp_quantized_comm_hook"]
-
-

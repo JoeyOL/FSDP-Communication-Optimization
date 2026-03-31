@@ -11,27 +11,43 @@ _sketch_log_count = 0
 
 
 def _count_sketch_encode(g: torch.Tensor, width: int, depth: int) -> torch.Tensor:
+    """Count-sketch encode: 批量预计算所有 depth 层的 hash 和 sign，减少 kernel launch。
+
+    优化：预构造 (depth, d) 的 hash 索引矩阵和 sign 矩阵，
+    使用 scatter_add_ 批量处理所有层。
+    """
     d = g.numel()
     sketch = torch.zeros(depth, width, device=g.device, dtype=g.dtype)
-    # 预先构建索引和符号，避免在每一层重复创建大向量
     idx = torch.arange(d, device=g.device)
     s = 2 * (idx % 2) - 1
-    for dep in range(depth):
-        h = (idx * (dep + 1) + dep) % width
-        # 使用每一行的 1D 向量做 index_add_，避免在 dim=1 上对 1D source 进行索引导致越界。
-        sketch[dep].index_add_(0, h, g * s)
+
+    # 预计算所有层的 hash 索引: (depth, d)
+    deps = torch.arange(depth, device=g.device).unsqueeze(1)  # (depth, 1)
+    idx_expanded = idx.unsqueeze(0)  # (1, d)
+    h_all = (idx_expanded * (deps + 1) + deps) % width  # (depth, d)
+
+    # 批量 scatter_add_: g * s 对所有层相同
+    gs = g * s  # (d,)
+    gs_expanded = gs.unsqueeze(0).expand(depth, -1)  # (depth, d)
+    sketch.scatter_add_(1, h_all, gs_expanded)
     return sketch
 
 
 def _count_sketch_decode_all(sketch: torch.Tensor, d: int, width: int, depth: int) -> torch.Tensor:
-    est = torch.zeros(d, device=sketch.device, dtype=sketch.dtype)
-    # 同样复用 idx 和符号，减少大向量重复构造开销
+    """Count-sketch decode: 批量 gather 所有层，取中位数/均值。
+
+    优化：预构造 (depth, d) 的 hash 索引，一次 gather 替代 per-depth 循环。
+    """
     idx = torch.arange(d, device=sketch.device)
     s = 2 * (idx % 2) - 1
-    for dep in range(depth):
-        h = (idx * (dep + 1) + dep) % width
-        est += sketch[dep, h] * s
-    est /= depth
+
+    deps = torch.arange(depth, device=sketch.device).unsqueeze(1)
+    idx_expanded = idx.unsqueeze(0)
+    h_all = (idx_expanded * (deps + 1) + deps) % width  # (depth, d)
+
+    # 批量 gather: 从每层的 sketch 中取对应位置的值
+    gathered = torch.gather(sketch, 1, h_all)  # (depth, d)
+    est = (gathered * s.unsqueeze(0)).sum(dim=0) / depth
     return est
 
 
@@ -118,12 +134,7 @@ def fsdp_sketch_comm_hook(
     if do_log:
         logger.info(
             "[sketch] hook_start d=%s k=%s ratio=%.4f two_round=%s ef=%s (call#%s)",
-            d,
-            k,
-            state.ratio,
-            getattr(state, "two_round", False),
-            state.error_feedback,
-            _sketch_log_count,
+            d, k, state.ratio, getattr(state, "two_round", False), state.error_feedback, _sketch_log_count,
         )
         if g.device.type == "cuda":
             ev_start = torch.cuda.Event(enable_timing=True)
@@ -139,48 +150,34 @@ def fsdp_sketch_comm_hook(
     if state.error_feedback:
         residual, start, end = _ensure_residual(state, g, pg)
         if start is None:
-            if do_log:
-                logger.info("[sketch] apply_error_feedback full residual")
             g = (g + residual).to(g.dtype)
         else:
-            if do_log:
-                logger.info("[sketch] apply_error_feedback local residual slice [%s:%s]", start, end)
             g[start:end] += residual
 
     if do_log and g.device.type == "cuda":
         ev_after_ef.record()
 
     if getattr(state, "two_round", False):
-        if do_log:
-            logger.info("[sketch] two_round: encode sketch")
         sketch = state._count_sketch(g, width, depth)
         if do_log and g.device.type == "cuda":
             ev_after_encode.record()
 
         sketch_flat = sketch.view(-1)
         if hasattr(dist, "all_reduce"):
-            if do_log:
-                logger.info("[sketch] two_round: all_reduce sketch start")
             dist.all_reduce(sketch_flat, op=dist.ReduceOp.SUM, group=pg)
         merged_sketch = sketch_flat.view(depth, width) / float(world_size)
         if do_log and g.device.type == "cuda":
             ev_after_allreduce.record()
 
-        if do_log:
-            logger.info("[sketch] two_round: HEAVYMIX topk")
         topk_indices = _heavymix_topk_indices(merged_sketch, d, width, depth, k)
         values_at_topk = g[topk_indices]
         if do_log and g.device.type == "cuda":
             ev_after_heavy.record()
 
         if hasattr(dist, "all_gather_into_tensor"):
-            if do_log:
-                logger.info("[sketch] two_round: all_gather values start")
             all_vals = torch.empty(world_size * k, device=g.device, dtype=g.dtype)
             dist.all_gather_into_tensor(all_vals, values_at_topk.contiguous(), group=pg)
         else:
-            if do_log:
-                logger.info("[sketch] two_round: all_gather values (list) start")
             all_vals_list = [torch.empty_like(values_at_topk) for _ in range(world_size)]
             dist.all_gather(all_vals_list, values_at_topk.contiguous(), group=pg)
             all_vals = torch.cat(all_vals_list, dim=0)
@@ -196,7 +193,6 @@ def fsdp_sketch_comm_hook(
         shard_out.copy_(deq_avg)
 
         if state.error_feedback:
-            # 不要再次调用 _ensure_residual：本参数已在上面调用过一次，再调会多占槽位导致后续参数错位
             full_reconstructed = torch.zeros_like(g)
             full_reconstructed[topk_indices] = full_sum[topk_indices] / float(world_size)
             diff = g - full_reconstructed
@@ -211,9 +207,6 @@ def fsdp_sketch_comm_hook(
                 elif residual.numel() == diff.numel():
                     residual.copy_(diff)
 
-        # 通信字节统计（两轮）：
-        # Round1: all_reduce(sketch_flat)，payload 大小约 depth * width * sizeof(float)
-        # Round2: all_gather(values_at_topk)，payload 大小约 k * sizeof(float)
         try:
             elem_size = g.element_size()
             round1_bytes = depth * width * elem_size
@@ -233,35 +226,23 @@ def fsdp_sketch_comm_hook(
             ms_tail = float(ev_after_round2_gather.elapsed_time(ev_end))
             logger.info(
                 "[sketch][timing two_round] ef=%.3fms encode=%.3fms allreduce=%.3fms heavy=%.3fms round2_gather=%.3fms tail(decode+copy+ef)=%.3fms",
-                ms_ef,
-                ms_encode,
-                ms_allreduce,
-                ms_heavy,
-                ms_round2,
-                ms_tail,
+                ms_ef, ms_encode, ms_allreduce, ms_heavy, ms_round2, ms_tail,
             )
         return
 
-    if do_log:
-        logger.info("[sketch] one_round: encode sketch")
     sketch = state._count_sketch(g, width, depth)
     if do_log and g.device.type == "cuda":
         ev_after_encode.record()
 
-    if do_log:
-        logger.info("[sketch] one_round: recover_heavy")
     sparse = state._recover_heavy(g, sketch, width, depth, k)
 
     shard_size = d // world_size
     temp_shard = torch.empty(shard_size, device=g.device, dtype=g.dtype)
-    if do_log:
-        logger.info("[sketch] one_round: reduce_scatter start")
     if hasattr(dist, "reduce_scatter_tensor"):
         dist.reduce_scatter_tensor(temp_shard, sparse, op=dist.ReduceOp.SUM, group=pg)
     else:
         chunks = list(sparse.chunk(world_size, dim=0))
         dist.reduce_scatter(temp_shard, chunks, op=dist.ReduceOp.SUM, group=pg)
-    # 近似统计：按 sparse 元素数估算 reduce_scatter 负载
     try:
         _comm_add_bytes(state, sparse.numel() * sparse.element_size())
     except Exception:
@@ -283,13 +264,8 @@ def fsdp_sketch_comm_hook(
         ms_tail = float(ev_after_reduce_scatter.elapsed_time(ev_end))
         logger.info(
             "[sketch][timing one_round] ef=%.3fms encode=%.3fms reduce_scatter=%.3fms tail(recover+copy+ef)=%.3fms",
-            ms_ef,
-            ms_encode,
-            ms_reduce_scatter,
-            ms_tail,
+            ms_ef, ms_encode, ms_reduce_scatter, ms_tail,
         )
 
 
 __all__ = ["SketchState", "fsdp_sketch_comm_hook"]
-
-

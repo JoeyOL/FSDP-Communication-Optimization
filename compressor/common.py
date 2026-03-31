@@ -141,6 +141,9 @@ def _sparse_all_gather_and_merge(
     """
     各 rank 发送 (indices, values)，all_gather 后合并为完整梯度向量 sum_r sparse_r。
     indices/values 形状均为 (k,)；返回 full 形状 (numel,)，dtype/device 与 values 一致。
+
+    优化：将所有 rank 的 indices/values 展平后执行单次 index_add_，
+    消除 per-rank Python 循环（原实现为 world_size 次 index_add_）。
     """
     if group is None:
         group = dist.group.WORLD
@@ -165,16 +168,14 @@ def _sparse_all_gather_and_merge(
         values_buf = torch.empty(world_size * k, device=device, dtype=dtype)
         dist.all_gather_into_tensor(indices_buf, indices_flat, group=group)
         dist.all_gather_into_tensor(values_buf, values_flat, group=group)
-        indices_all = indices_buf.view(world_size, k)
-        values_all = values_buf.view(world_size, k)
     else:
         indices_list = [torch.empty(k, device=device, dtype=indices.dtype) for _ in range(world_size)]
         values_list = [torch.empty(k, device=device, dtype=dtype) for _ in range(world_size)]
         dist.all_gather(indices_list, indices_flat, group=group)
         dist.all_gather(values_list, values_flat, group=group)
-        indices_all = torch.stack(indices_list, dim=0)
-        values_all = torch.stack(values_list, dim=0)
-    # 通信字节统计采用“每 rank 发送的 payload”为基准：
+        indices_buf = torch.cat(indices_list, dim=0)
+        values_buf = torch.cat(values_list, dim=0)
+    # 通信字节统计采用"每 rank 发送的 payload"为基准：
     # k 个 indices（int64）+ k 个 values（与梯度同 dtype），与 tools/compute_trace_stats.py 中的公式保持一致。
     try:
         per_rank_bytes = k * (indices.element_size() + values.element_size())
@@ -185,11 +186,9 @@ def _sparse_all_gather_and_merge(
     if use_cuda_timer:
         ev1.record()
 
+    # 优化：单次 index_add_ 替代 world_size 次循环
     full = torch.zeros(numel, device=device, dtype=dtype)
-    for r in range(world_size):
-        idx = indices_all[r].long()
-        val = values_all[r]
-        full.index_add_(0, idx, val)
+    full.index_add_(0, indices_buf.view(-1).long(), values_buf.view(-1))
 
     if use_cuda_timer:
         ev2.record()
@@ -215,4 +214,3 @@ __all__ = [
     "_apply_error_feedback",
     "_sparse_all_gather_and_merge",
 ]
-

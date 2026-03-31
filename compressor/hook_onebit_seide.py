@@ -76,7 +76,6 @@ def _onebit_seide_per_column(g: torch.Tensor, col_size: int) -> Tuple[torch.Tens
     signs_neg = 1.0 - signs_pos
 
     # 向量化计算每列的 a 和 b
-    # 将 g 重塑为 (num_cols, col_size)，不足的用 0 填充
     n_pad = (col_size - numel % col_size) % col_size
     if n_pad > 0:
         g_padded = torch.cat([g, torch.zeros(n_pad, device=device, dtype=dtype)])
@@ -87,17 +86,15 @@ def _onebit_seide_per_column(g: torch.Tensor, col_size: int) -> Tuple[torch.Tens
         signs_pos_padded = signs_pos
         signs_neg_padded = signs_neg
 
-    g_cols = g_padded.view(num_cols, col_size)  # (num_cols, col_size)
-    pos_mask = signs_pos_padded.view(num_cols, col_size)  # (num_cols, col_size)
-    neg_mask = signs_neg_padded.view(num_cols, col_size)  # (num_cols, col_size)
+    g_cols = g_padded.view(num_cols, col_size)
+    pos_mask = signs_pos_padded.view(num_cols, col_size)
+    neg_mask = signs_neg_padded.view(num_cols, col_size)
 
-    # 计算每列的正值均值和负值均值
-    pos_sum = (g_cols * pos_mask).sum(dim=1)  # (num_cols,)
-    pos_count = pos_mask.sum(dim=1)  # (num_cols,)
-    neg_sum = (g_cols * neg_mask).sum(dim=1)  # (num_cols,)
-    neg_count = neg_mask.sum(dim=1)  # (num_cols,)
+    pos_sum = (g_cols * pos_mask).sum(dim=1)
+    pos_count = pos_mask.sum(dim=1)
+    neg_sum = (g_cols * neg_mask).sum(dim=1)
+    neg_count = neg_mask.sum(dim=1)
 
-    # 避免除零
     a_vec = torch.where(pos_count > 0, pos_sum / pos_count.clamp(min=1e-8), torch.zeros_like(pos_sum))
     b_vec = torch.where(neg_count > 0, neg_sum / neg_count.clamp(min=1e-8), torch.zeros_like(neg_sum))
 
@@ -117,7 +114,6 @@ def _onebit_seide_reconstruct_from_gathered(
 ) -> torch.Tensor:
     """full_sum[i] = sum_r (a_r[c] if sign_r[i] >= 0 else b_r[c])."""
     global _ONEBIT_CPP_RUNTIME_AVAILABLE
-    # 有 C++ 实现且运行时可用时优先使用
     if _HAS_ONEBIT_CPP and _ONEBIT_CPP_RUNTIME_AVAILABLE:
         try:
             return cpp_onebit_seide_reconstruct(signs_all, a_all, b_all, numel, col_size)
@@ -132,19 +128,16 @@ def _onebit_seide_reconstruct_from_gathered(
     col_idx = torch.arange(numel, device=device, dtype=torch.long) // col_size
     col_idx = col_idx.clamp(max=num_cols - 1)
 
-    # 批量解包所有 signs（一次性处理所有 rank）
-    # signs_all: (world_size, packed_bytes) -> (world_size, numel)
     signs_unpacked = _unpack_signs_from_bytes_all(signs_all, numel)
 
-    # 批量扩展 a 和 b: (world_size, num_cols) -> (world_size, numel)
-    col_idx_expanded = col_idx.unsqueeze(0).expand(world_size, -1)  # (world_size, numel)
+    col_idx_expanded = col_idx.unsqueeze(0).expand(world_size, -1)
     col_idx_expanded = col_idx_expanded.clamp(min=0, max=num_cols - 1)
 
-    a_expanded = torch.gather(a_all, dim=1, index=col_idx_expanded)  # (world_size, numel)
-    b_expanded = torch.gather(b_all, dim=1, index=col_idx_expanded)  # (world_size, numel)
+    a_expanded = torch.gather(a_all, dim=1, index=col_idx_expanded)
+    b_expanded = torch.gather(b_all, dim=1, index=col_idx_expanded)
 
-    recon_all = torch.where(signs_unpacked >= 0, a_expanded, b_expanded)  # (world_size, numel)
-    return recon_all.sum(dim=0)  # (numel,)
+    recon_all = torch.where(signs_unpacked >= 0, a_expanded, b_expanded)
+    return recon_all.sum(dim=0)
 
 
 class OneBitSeideState:
@@ -152,7 +145,6 @@ class OneBitSeideState:
         self.col_size = col_size
         self.error_feedback = error_feedback
         self._ef_local = ef_local
-        # 是否尝试使用 C++/CUDA 扩展实现 1-bit Seide（如果可用）
         self.use_cpp = use_cpp
 
 
@@ -161,7 +153,11 @@ def fsdp_onebit_seide_comm_hook(
     full_flat_grad: torch.Tensor,
     shard_out: torch.Tensor,
 ) -> None:
-    """1-bit Seide: per-column (a,b) minimize squared error, transmit signs + (a,b), EF."""
+    """1-bit Seide: per-column (a,b) minimize squared error, transmit signs + (a,b), EF.
+
+    优化：移除 3 个冗余的 all_reduce（packed_bytes, ab_per_rank, num_cols），
+    因为 FSDP 保证各 rank 的梯度形状一致，这些维度天然相同。
+    """
     global _ONEBIT_CPP_RUNTIME_AVAILABLE
 
     pg = dist.group.WORLD
@@ -172,25 +168,16 @@ def fsdp_onebit_seide_comm_hook(
         shard_out.copy_(full_flat_grad)
         return
 
-    # 如果显式关闭 C++/CUDA 补丁，则禁用 C++ 路径（本进程内全局）
     if not getattr(state, "use_cpp", True):
         _ONEBIT_CPP_RUNTIME_AVAILABLE = False
 
-    # 移除大部分日志，只保留关键信息（首次调用时）
     if not hasattr(state, "_logged_once"):
         logger.info(
             f"[1bit_seide R{rank}] Hook initialized: col_size={state.col_size}, error_feedback={state.error_feedback}"
         )
         state._logged_once = True
 
-    # 记录原始形状用于调试
-    original_shape = full_flat_grad.shape
     g = full_flat_grad.contiguous().view(-1)
-    numel_original = g.numel()
-
-    # 如果形状异常，记录警告
-    if original_shape != (numel_original,):
-        logger.debug(f"[1bit_seide R{rank}] full_flat_grad reshaped: {original_shape} -> {g.shape}")
 
     if state.error_feedback:
         residual, start, end = _ensure_residual(state, g, pg)
@@ -209,34 +196,13 @@ def fsdp_onebit_seide_comm_hook(
     packed_bytes = packed.numel()
     ab_per_rank = num_cols * 2
 
-    # 确保所有 rank 的维度一致（FSDP 应该保证，但添加保护）
-    # 使用异步操作减少等待时间
-    packed_bytes_tensor = torch.tensor(packed_bytes, device=g.device, dtype=torch.long)
-    ab_per_rank_tensor = torch.tensor(ab_per_rank, device=g.device, dtype=torch.long)
-    dist.all_reduce(packed_bytes_tensor, op=dist.ReduceOp.MAX, group=pg, async_op=False)
-    dist.all_reduce(ab_per_rank_tensor, op=dist.ReduceOp.MAX, group=pg, async_op=False)
-    packed_bytes = packed_bytes_tensor.item()
-    ab_per_rank = ab_per_rank_tensor.item()
+    # 优化：移除了 3 个 all_reduce（packed_bytes, ab_per_rank, num_cols）。
+    # FSDP 保证各 rank 的 full_flat_grad 形状一致 → numel 一致 → col_size, num_cols,
+    # packed_bytes, ab_per_rank 天然一致，无需跨 rank 同步。
 
-    # 如果当前 rank 的 packed 较小，需要填充
-    if packed.numel() < packed_bytes:
-        packed_padded = torch.zeros(packed_bytes, device=g.device, dtype=torch.uint8)
-        packed_padded[: packed.numel()] = packed
-        packed = packed_padded
-
-    # 如果当前 rank 的 ab 较小，需要填充
     ab_vec = torch.cat([a_vec, b_vec])
-    if ab_vec.numel() < ab_per_rank:
-        ab_padded = torch.zeros(ab_per_rank, device=g.device, dtype=g.dtype)
-        ab_padded[: ab_vec.numel()] = ab_vec
-        ab_vec = ab_padded
 
-    # 同步 num_cols（FSDP 应该保证相同，但添加保护）
-    num_cols_tensor = torch.tensor(num_cols, device=g.device, dtype=torch.long)
-    dist.all_reduce(num_cols_tensor, op=dist.ReduceOp.MAX, group=pg, async_op=False)
-    num_cols = num_cols_tensor.item()
-
-    # 记录本次 all-gather 的通信字节数（按每个 rank 发送的 payload 估算）
+    # 记录本次 all-gather 的通信字节数
     per_rank_bytes = int(packed_bytes) + int(ab_per_rank) * g.element_size()
     _comm_add_bytes(state, per_rank_bytes)
 
@@ -265,11 +231,7 @@ def fsdp_onebit_seide_comm_hook(
         signs_all, a_all, b_all, numel, col_size, world_size, g.device, g.dtype
     )
 
-    # 检查 full_sum 的形状
     if full_sum.shape[0] != numel:
-        logger.error(
-            f"[1bit_seide R{rank}] full_sum shape mismatch: full_sum.shape={full_sum.shape}, expected numel={numel}, g.shape={g.shape}, full_flat_grad.shape={full_flat_grad.shape}"
-        )
         raise RuntimeError(f"full_sum shape mismatch: {full_sum.shape} vs {numel}")
 
     shard_size = numel // world_size
@@ -281,7 +243,6 @@ def fsdp_onebit_seide_comm_hook(
 
     if state.error_feedback:
         full_reconstructed = full_sum / float(world_size)
-        # 使用 _ensure_residual 管理的 residual 更新误差反馈
         idx = getattr(state, "_ef_index", 1) - 1
         res_list = getattr(state, "_ef_residual_list", None)
         if idx >= 0 and res_list is not None and idx < len(res_list) and res_list[idx] is not None:
@@ -296,5 +257,3 @@ def fsdp_onebit_seide_comm_hook(
 
 
 __all__ = ["OneBitSeideState", "fsdp_onebit_seide_comm_hook"]
-
-

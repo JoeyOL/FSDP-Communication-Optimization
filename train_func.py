@@ -19,11 +19,57 @@ from perf.comm_stats import snapshot as comm_snapshot, total_bytes as comm_total
 from perf.grad_error_stats import snapshot as grad_error_snapshot
 
 
+# ---------------------------------------------------------------------------
+# P2 fix / documentation: ShardedGradScaler + communication hook interaction
+# ---------------------------------------------------------------------------
+# PyTorch FSDP communication hooks (registered via
+# model.register_comm_hook(state, hook)) run INSIDE the backward pass.
+# When ShardedGradScaler is used, it calls scaler.scale(loss).backward(),
+# which means gradients seen by the hook are already multiplied by the
+# scaler's current scale factor (typically a large power-of-2).
+#
+# Impact on compression algorithms:
+#   - INT8 / FP16 / SignSGD / 1-bit Seide: These normalise or quantise
+#     relative to max/norm, so uniform scaling does NOT change behaviour.
+#   - QSGD / NC: Bucket norms and stochastic rounding are scale-invariant.
+#   - TopK / RandomK / ThresholdV: Absolute threshold comparisons (v_pos,
+#     v_neg) would be affected if set as raw values. However, ratio-based
+#     selection (ratio=0.01) is unaffected since it operates on relative
+#     ordering.
+#   - Sketch: Count-sketch + heavy hitter detection operates on actual
+#     magnitudes, but since all elements are uniformly scaled, top-k
+#     selection is still correct.
+#
+# Conclusion: For ratio-based or relative compression, GradScaler is safe.
+# If users specify absolute thresholds (e.g., ThresholdV with v > 0), they
+# should be aware that the effective threshold in gradient space is
+# threshold / scaler.get_scale().
+#
+# For users who want to disable mixed-precision scaling entirely (e.g., when
+# using bfloat16 which doesn't need loss scaling), set use_grad_scaler=False
+# via args.
+# ---------------------------------------------------------------------------
+
+
+def _create_grad_scaler(args) -> ShardedGradScaler | None:
+    """Create ShardedGradScaler based on configuration.
+
+    Returns None if gradient scaling is disabled (e.g., bfloat16 training
+    where loss scaling is unnecessary and could interfere with absolute-
+    threshold compression algorithms).
+    """
+    use_scaler = getattr(args, "use_grad_scaler", True)
+    if not use_scaler:
+        logger.info("[train] GradScaler disabled via args.use_grad_scaler=False")
+        return None
+    return ShardedGradScaler()
+
+
 # --- 新增带监控的训练函数 ---
 def train_epoch_with_monitoring(model, dataloader, optimizer, scheduler, epoch, rank, world_size, args):
     """训练一个epoch，并使用Profiler和TensorBoard进行监控"""
     model.train()
-    scaler = ShardedGradScaler()
+    scaler = _create_grad_scaler(args)
     total_loss = 0.0
     num_batches = len(dataloader)
 
@@ -62,17 +108,24 @@ def train_epoch_with_monitoring(model, dataloader, optimizer, scheduler, epoch, 
             
             # 2. 反向传播
             with record_function("backward_pass"): # Profiler 记录
-                scaler.scale(loss).backward()
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
             
             total_loss += loss.item() * args.gradient_accumulation_steps
 
             # 3. 梯度累积和更新
             if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (batch_idx + 1) == num_batches:
                 with record_function("optimizer_step"): # Profiler 记录
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
+                    if scaler is not None:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        optimizer.step()
                     optimizer.zero_grad()
                     scheduler.step()
 
@@ -181,7 +234,7 @@ def train_epoch_with_monitoring(model, dataloader, optimizer, scheduler, epoch, 
 def train_epoch(model, dataloader, optimizer, scheduler, epoch, rank, world_size, args, save_checkpoint_fn=None):
     """训练一个epoch"""
     model.train()
-    scaler = ShardedGradScaler()  # FSDP-compatible GradScaler
+    scaler = _create_grad_scaler(args)
     total_loss = 0.0
     num_batches = len(dataloader)
     optimizer.zero_grad()  # 初始化梯度
@@ -210,19 +263,26 @@ def train_epoch(model, dataloader, optimizer, scheduler, epoch, rank, world_size
                 continue
             
             # 2. 反向传播 (计算缩放后的梯度)
-            scaler.scale(loss).backward()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
             
             total_loss += loss.item() * args.gradient_accumulation_steps # 记录未缩放的损失
 
             # 3. 梯度累积和更新
             if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (batch_idx + 1) == num_batches:
-                # 3.1 (可选但推荐) 梯度裁剪，在优化器步骤之前
-                # 首先 unscale 梯度
-                scaler.unscale_(optimizer)
-                # 然后在原始梯度上进行裁剪
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
+                if scaler is not None:
+                    # 3.1 (可选但推荐) 梯度裁剪，在优化器步骤之前
+                    # 首先 unscale 梯度
+                    scaler.unscale_(optimizer)
+                    # 然后在原始梯度上进行裁剪
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
                 optimizer.zero_grad()
                 scheduler.step()
                 
