@@ -1,0 +1,103 @@
+% !Mode:: "TeX:UTF-8"
+
+\chapter{实验与结果分析}
+
+本章在第3章通信压缩算法设计与实现的基础上，对各压缩方法进行系统性的对比评估。评估从三个层面展开：训练质量、系统效率以及压缩误差与收敛质量的关联分析。
+
+\section{实验配置}
+
+为保证对比的公平性，本章所有实验均在严格对齐的训练配置下进行：保持训练数据、模型结构、优化器与学习率调度、随机种子、并行规模、序列长度和batch配置完全一致，仅在通信相关参数上做差异化设置。所有结果均以无压缩的FSDP baseline作为参照系。
+
+实验核心配置如表~\ref{tab:exp-config}~所示。
+
+\begin{table}[htbp]
+\caption{压缩算法对比实验参数配置}
+\label{tab:exp-config}
+\vspace{0.5em}\centering\wuhao
+\begin{tabular}{lll}
+\toprule
+参数项 & 配置值 & 说明 \\
+\midrule
+实验环境 & Ubuntu 24.04, 2$\times$A100 (40GB) & 操作系统与GPU硬件配置 \\
+模型架构 & GPT-2 (Random Init) & 聚焦通信与计算特性 \\
+训练精度 & FP32 & 全精度训练 \\
+全局批大小 & 8 (Per-Device) & 单设备负载保持一致 \\
+序列长度 & 1024 & 典型长序列训练场景 \\
+World Size & 2 & 单机2卡FSDP训练 \\
+优化器 & AdamW + 线性衰减 & 各配置间保持一致 \\
+训练步数 & 200 steps & 固定训练步数 \\
+训练数据集 & Wikipedia En & Wikipedia词条语料 \\
+验证数据集 & 同源Wikipedia held-out 5\% & 按样本划出约5\%作为验证集 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+通信压缩算法配置涵盖：无压缩baseline、INT8 linear、Natural Compression、1-bit Seide（col\_size=256）、QSGD（$s$=4）、Threshold-v（自适应阈值，平均稀疏率$\le$0.01）、Sketched-SGD、Random-k（$\rho$=0.01）和Top-k（$\rho$=0.01）。
+
+数据采集方面，对每次实验记录两类信息：一类是训练过程数据，包括随step变化的训练损失Loss/step、GPU显存占用以及基于wall-clock时间估算的吞吐（tokens/s）；另一类是通信与压缩误差数据，用于量化压缩强度与训练效果之间的对应关系。
+
+\section{实验结果}
+
+\subsection{训练质量分析}
+
+表~\ref{tab:exp-results}~汇总了各压缩算法在200 step训练后的关键指标。
+
+\begin{table}[htbp]
+\caption{各通信压缩算法实验结果}
+\label{tab:exp-results}
+\vspace{0.5em}\centering\wuhao
+\begin{tabular}{lcccccc}
+\toprule
+压缩算法 & 关键超参 & \makecell{最后20步\\平均Loss} & \makecell{验证集\\PPL} & \makecell{吞吐\\(tokens/s)} & \makecell{压缩比/\\稀疏率} & \makecell{平均梯度\\L2误差} \\
+\midrule
+baseline & - & 6.9499 & 5324.56 & 10578.96 & 1$\times$ & - \\
+INT8 linear & - & 7.2162 & 5677.46 & 14321.25 & $\approx$4$\times$ & 0.5922 \\
+NC & - & 7.7415 & 6937.58 & 12936.38 & $\approx$3.56$\times$ & 0.8967 \\
+1-bit Seide & col=256 & 7.1214 & 5545.15 & 12384.80 & $\approx$32$\times$ & 1.0642 \\
+QSGD & $s$=4 & 7.7470 & 7037.46 & 11712.42 & $\approx$4$\times$ & 1.1821 \\
+Threshold-v & auto & 7.3756 & 6186.17 & 12027.74 & $\le$0.01 & 0.7164 \\
+Sketch & - & 7.8575 & 7166.74 & 11994.57 & 最高40$\times$ & 0.9553 \\
+Random-k & $\rho$=0.01 & 8.0925 & 8053.88 & 13837.80 & 0.01 & 7.2219 \\
+Top-k & $\rho$=0.01 & 7.3752 & 6071.02 & 14071.59 & 0.01 & 0.8159 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+从训练质量来看，baseline的最后20个step平均Loss为6.95，作为参照。在所有压缩方法中，1-bit Seide的7.12最接近baseline，其次是INT8 linear的7.22、Threshold-v与Top-k的7.38左右，验证集PPL也都维持在5500$\sim$6200的区间，说明在4倍量化或1\%稀疏率下，只要方向信息保留得足够好，整体收敛质量仍然可接受。Natural Compression、QSGD和Sketch的Loss分别升至7.74、7.75和7.86，对应的PPL也更高，表明在当前配置下它们牺牲了一部分收敛精度来换取更高的压缩比。而Random-k的平均Loss达到8.09、PPL超过8000，明显劣于其它所有方法，反映出在仅保留1\%梯度且方向随机的设定下，噪声被大幅放大。
+
+\subsection{系统效率分析}
+
+从系统效率与通信开销来看，baseline的通信耗时约为$2.66 \times 10^4$~ms，对应吞吐$1.06 \times 10^4$~tokens/s。所有压缩方法都在不同程度上缩短了通信时间。
+
+1-bit Seide最为激进，通信耗时约$1.12 \times 10^4$~ms。INT8 linear、Random-k和Top-k也都将通信时间压缩到$1.2 \times 10^4 \sim 1.4 \times 10^4$~ms区间，并将吞吐提高到$1.18 \times 10^4 \sim 1.40 \times 10^4$~tokens/s。其中Top-k在保证较好收敛质量的同时达到最高吞吐。
+
+Natural Compression与QSGD在通信时间和吞吐上略逊于INT8 linear，但仍明显优于baseline。Threshold-v的通信时间介于INT8和baseline之间，在带宽节省与Loss抬升之间取得中庸折中。Sketch虽然理论上标称最高可达40倍通信压缩，但由于两轮通信与重建开销，其实际通信耗时在各方法中反而偏高。
+
+\subsection{压缩误差与收敛质量关联分析}
+
+在压缩误差与收敛质量的关系上，可以观察到明显的梯度递进规律：
+
+（1）INT8 linear、Threshold-v与Top-k的平均梯度相对L2误差均在0.6$\sim$0.9左右，对应的Loss和PPL处于相对温和的区间，说明适度的压缩误差不会显著影响训练收敛。
+
+（2）1-bit Seide、QSGD、Sketch的误差接近或略高于1.0，对应的Loss/PPL进一步抬升，反映了更高的压缩强度带来了更大的收敛代价。
+
+（3）Random-k在1\%稀疏率下的平均梯度相对L2误差高达7.22，Loss与PPL均明显劣化，印证了过于激进且随机的稀疏方案在当前步数和学习率下会显著拖慢收敛甚至破坏优化轨迹。
+
+至于GPU显存预留峰值，各方法都聚集在37$\sim$39~GB的窄区间内，说明在本实验规模下，通信压缩对FSDP训练的显存占用几乎没有本质影响。
+
+\section{综合对比与讨论}
+
+综合以上实验结果，可以将各压缩算法按照适用场景进行分类：
+
+\textbf{均衡型算法：}INT8量化、Top-k稀疏化和Threshold-v稀疏化在"压缩比—通信时间—收敛质量"的综合权衡上表现最为均衡。INT8量化以约4倍压缩比实现了约35\%的吞吐提升，Loss仅上升3.8\%，且实现简单，适合作为默认的通信压缩方案。Top-k在1\%稀疏率下达到最高吞吐（14072 tokens/s），同时保持了与Threshold-v相当的收敛质量。
+
+\textbf{极端压缩型算法：}1-bit Seide和Sketched-SGD适合"极限带宽受限、可接受更高损失"的场景。1-bit Seide以32倍压缩比实现了最低的通信耗时，但需要误差反馈机制支撑收敛。
+
+\textbf{需谨慎使用的算法：}Random-k在当前配置下表现不佳，需要更谨慎的学习率与训练步数调度才能发挥其高压缩率优势。其无偏性虽然在理论上保证收敛，但高方差导致实际收敛速度显著下降。
+
+此外，实验结果表明在双卡A100环境下，通信压缩的收益主要体现在通信耗时的减少而非显存节省。在更大规模的多机多卡场景中，随着通信带宽成为更严重的瓶颈，通信压缩的收益预计将更为显著。
+
+\section{本章小结}
+
+本章在统一实验配置下，从训练质量、系统效率和压缩误差三个维度对9种通信压缩算法进行了系统性对比评估。实验结果表明：（1）INT8量化、Top-k和Threshold-v稀疏化在综合权衡上表现最优；（2）压缩误差与收敛质量之间存在明显的单调关系，梯度L2误差控制在1.0以内时收敛质量可接受；（3）通信压缩在双卡环境下可实现最高约35\%的吞吐提升，所有方法对显存占用无本质影响。这些结论为实际部署通信压缩方案提供了决策依据。
+

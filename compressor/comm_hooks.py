@@ -14,6 +14,7 @@ from perf.grad_error_stats import add_sample as _grad_add_sample
 
 from .hook_fp16 import FP16State, fsdp_fp16_comm_hook
 from .hook_hybrid_topk_int8 import HybridTopKInt8State, fsdp_hybrid_topk_int8_comm_hook
+from .hook_hybrid import HybridCompressState, fsdp_hybrid_comm_hook
 from .hook_int8 import GradQuantState, fsdp_quantized_comm_hook
 from .hook_nc import NCState, fsdp_nc_comm_hook
 from .hook_onebit_seide import OneBitSeideState, fsdp_onebit_seide_comm_hook
@@ -23,6 +24,7 @@ from .hook_signsgd import SignSGDState, fsdp_signsgd_comm_hook
 from .hook_sketch import SketchState, fsdp_sketch_comm_hook
 from .hook_thresholdv import ThresholdVState, fsdp_thresholdv_comm_hook
 from .hook_topk import TopKState, fsdp_topk_comm_hook
+from .adaptive_scheduler import AdaptiveCompressState, fsdp_adaptive_comm_hook
 
 
 # ---------------------------------------------------------------------------
@@ -34,7 +36,7 @@ def _wrap_with_grad_error_stats(
     hook: Callable[[Any, torch.Tensor, torch.Tensor], None]
 ) -> Callable[[Any, torch.Tensor, torch.Tensor], None]:
     """
-    在不改变原有 hook 接口的前提下，额外记录一次“压缩前后梯度的相对 L2 误差”。
+    在不改变原有 hook 接口的前提下，额外记录一次"压缩前后梯度的相对 L2 误差"。
 
     记 full_flat_grad 为当前 FSDP 单元在某个 rank 上的完整扁平梯度，shard_out 为通信
     完成后该 rank 上的梯度分片。本包装器在原 hook 执行完毕（即 shard_out 已被写入）
@@ -118,6 +120,16 @@ def build_comm_hook(
     signsgd_use_delta: bool = False,
     nc_use_bit_packing: bool = True,
     nc_use_norm_scale: bool = True,
+    # --- Hybrid two-stage parameters ---
+    hybrid_sparse_method: str = "topk",
+    hybrid_quant_method: str = "int8",
+    # --- Adaptive scheduler parameters ---
+    adaptive_base_hook: str = "int8",
+    adaptive_schedule: str = "warmup_decay",
+    adaptive_total_steps: int = 1000,
+    adaptive_warmup_fraction: float = 0.1,
+    adaptive_min_ratio: float = 0.001,
+    adaptive_max_ratio: float = 0.1,
     **kwargs: Any,
 ) -> Tuple[Optional[Any], Optional[Any]]:
     if name is None:
@@ -193,7 +205,100 @@ def build_comm_hook(
         attach_grad_error_to_state(state, n)
         return state, _wrap_with_grad_error_stats(fsdp_hybrid_topk_int8_comm_hook)
 
+    # ── Generalized hybrid two-stage compression ──
+    # Names: hybrid_topk_1bit, hybrid_thresholdv_int8, hybrid_thresholdv_1bit, hybrid_randomk_int8
+    # Also accept "hybrid" as alias for hybrid_topk_int8 (generalized version)
+    if n.startswith("hybrid_") and n != "hybrid_topk_int8":
+        # Parse: hybrid_{sparse}_{quant}
+        parts = n.split("_", 1)  # ["hybrid", "topk_1bit"] etc.
+        tail = parts[1] if len(parts) > 1 else ""
+        # Determine sparse/quant from the name
+        sparse_m = hybrid_sparse_method  # default from kwarg
+        quant_m = hybrid_quant_method    # default from kwarg
+        if tail == "topk_1bit":
+            sparse_m, quant_m = "topk", "1bit"
+        elif tail == "thresholdv_int8":
+            sparse_m, quant_m = "thresholdv", "int8"
+        elif tail == "thresholdv_1bit":
+            sparse_m, quant_m = "thresholdv", "1bit"
+        elif tail == "randomk_int8":
+            sparse_m, quant_m = "randomk", "int8"
+        elif tail == "topk_int8_v2":
+            sparse_m, quant_m = "topk", "int8"
+        # else: use the kwarg defaults
+
+        ratio = topk_ratio if sparse_m == "topk" else (randomk_ratio if sparse_m == "randomk" else threshold_ratio)
+        k_val = topk_k if sparse_m == "topk" else (randomk_k if sparse_m == "randomk" else 0)
+        tv = threshold_v if sparse_m == "thresholdv" else 0.0
+
+        state = HybridCompressState(
+            sparse_method=sparse_m,
+            quant_method=quant_m,
+            ratio=ratio,
+            k=k_val,
+            threshold_v=tv,
+            error_feedback=ef,
+            ef_local=ef_local,
+        )
+        attach_to_state(state, n)
+        attach_grad_error_to_state(state, n)
+        return state, _wrap_with_grad_error_stats(fsdp_hybrid_comm_hook)
+
+    if n == "hybrid":
+        # Generic hybrid with explicit sparse/quant method kwargs
+        ratio = topk_ratio if hybrid_sparse_method == "topk" else (randomk_ratio if hybrid_sparse_method == "randomk" else threshold_ratio)
+        k_val = topk_k if hybrid_sparse_method == "topk" else (randomk_k if hybrid_sparse_method == "randomk" else 0)
+        tv = threshold_v if hybrid_sparse_method == "thresholdv" else 0.0
+
+        state = HybridCompressState(
+            sparse_method=hybrid_sparse_method,
+            quant_method=hybrid_quant_method,
+            ratio=ratio,
+            k=k_val,
+            threshold_v=tv,
+            error_feedback=ef,
+            ef_local=ef_local,
+        )
+        attach_to_state(state, n)
+        attach_grad_error_to_state(state, n)
+        return state, _wrap_with_grad_error_stats(fsdp_hybrid_comm_hook)
+
+    # ── Adaptive compression scheduler ──
+    if n == "adaptive" or n.startswith("adaptive_"):
+        state = AdaptiveCompressState(
+            base_hook_name=adaptive_base_hook,
+            schedule=adaptive_schedule,
+            total_steps=adaptive_total_steps,
+            warmup_fraction=adaptive_warmup_fraction,
+            min_ratio=adaptive_min_ratio,
+            max_ratio=adaptive_max_ratio,
+            error_feedback=ef,
+            ef_local=ef_local,
+            # Pass through all kwargs so inner hooks can be configured
+            hook_kwargs=dict(
+                num_bits=num_bits,
+                int8_variant=int8_variant,
+                sparse_comm=sparse_comm,
+                topk_k=topk_k,
+                topk_ratio=topk_ratio,
+                randomk_k=randomk_k,
+                randomk_ratio=randomk_ratio,
+                threshold_v=threshold_v,
+                threshold_ratio=threshold_ratio,
+                hybrid_sparse_method=hybrid_sparse_method,
+                hybrid_quant_method=hybrid_quant_method,
+            ),
+        )
+        attach_to_state(state, n)
+        attach_grad_error_to_state(state, n)
+        return state, _wrap_with_grad_error_stats(fsdp_adaptive_comm_hook)
+
+    supported = (
+        "none, int8, fp16, qsgd, signsgd, onebit, onebit_seide, nc, "
+        "topk, randomk, thresholdv, sketch, hybrid_topk_int8, "
+        "hybrid, hybrid_topk_1bit, hybrid_thresholdv_int8, hybrid_thresholdv_1bit, hybrid_randomk_int8, "
+        "adaptive"
+    )
     raise ValueError(
-        f"Unsupported comm hook: {name}. "
-        "Supported: none, int8, fp16, qsgd, signsgd, onebit, onebit_seide, nc, topk, randomk, thresholdv, sketch, hybrid_topk_int8"
+        f"Unsupported comm hook: {name}. Supported: {supported}"
     )

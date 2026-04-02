@@ -3,6 +3,11 @@
 \documentclass[fontset=fandol,type=bachelor,campus=harbin, chapterbold=false, tocblank=false]{hithesisbook}
 
 \usepackage{hithesis}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{makecell}
 \newcommand{\cndash}{\rule{0.2em}{0pt}\rule[0.35em]{1.6em}{0.05em}\rule{0.2em}{0pt}}
 
 \graphicspath{{figures/}}
@@ -11,27 +16,17 @@
 \frontmatter
 \input{front/cover} % 封面
 \makecover
-% \input{front/denotation}%物理量名称表,符合规范为主，有要求添加
 \tableofcontents %目录
 \mainmatter
-\include{body/preface}
-\include{body/regu}
-\include{body/introduction}
-\include{body/name} % 新增章节内容文件
-% \include{examples/hitbook/chinese/body/cha1}
+\include{body/chapter1}  % 第1章 绪论
+\include{body/chapter2}  % 第2章 FSDP通信瓶颈分析与实验验证
+\include{body/chapter3}  % 第3章 通信压缩方法的设计与实现
+\include{body/chapter4}  % 第4章 实验与结果分析
 \backmatter
 \include{back/conclusion}   % 结论
 \bibliographystyle{gbt7714-numerical}
-
-
-
-
 \bibliography{reference} % 参考文献
-% \begin{appendix}%附录
-% \input{back/appA.tex}
-% \end{appendix}
 \include{back/publications}    % 所发文章
-% \include{back/ceindex}    % 索引, 根据自己的情况添加或者不添加，选择自动添加或者手工添加。
 \authorization %授权
 \include{back/acknowledgements} %致谢
 \end{document}
