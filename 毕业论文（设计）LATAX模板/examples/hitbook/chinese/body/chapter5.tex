@@ -1,0 +1,199 @@
+% !Mode:: "TeX:UTF-8"
+
+\chapter{混合压缩与自适应调度的设计与实现}
+
+第3章实现的9种通信压缩算法可分为量化与稀疏化两大类别，二者分别从"降低比特宽度"和"减少传输元素"两个正交维度实现通信量压缩。然而，单一维度的压缩手段在实际应用中往往面临压缩率上限或收敛质量瓶颈：量化方法在保持较好收敛性的同时压缩比通常不超过32倍，稀疏化方法虽可实现极高的名义压缩率但通信格式中索引的开销不可忽视。此外，第4章的实验结果表明，不同训练阶段对压缩强度的敏感程度存在显著差异——训练初期的大幅梯度变化要求更高保真的通信，而训练中后期梯度趋于稳定后则可容忍更强的压缩。
+
+基于以上观察，本章从两个方向对通信压缩方法进行扩展研究：（1）\textbf{两阶段混合压缩}，将稀疏化与量化级联应用以获得乘性压缩比；（2）\textbf{自适应压缩调度}，根据训练进度或梯度统计量动态调整压缩强度。
+
+\section{两阶段混合压缩}
+
+\subsection{设计动机}
+
+考虑Top-k稀疏化（$\rho=0.01$）与INT8量化的级联组合：第一阶段Top-k将需要传输的元素数量从$n$降至$k = \rho \cdot n$，第二阶段INT8将每个选中元素的表示位宽从32比特降至8比特。两阶段的压缩效果具有乘性关系：
+\begin{equation}
+r_{\text{total}} = r_{\text{sparse}} \times r_{\text{quant}} = \frac{1}{\rho} \times \frac{32}{8} = 100 \times 4 = 400.
+\label{eq:hybrid-ratio}
+\end{equation}
+其中$r_{\text{sparse}}$为稀疏化压缩比，$r_{\text{quant}}$为量化压缩比。若将量化方式从INT8替换为1-bit编码（仅保留符号位），则$r_{\text{quant}} = 32$，总压缩比可达$100 \times 32 = 3200$倍。
+
+在实际通信中，还需额外传输每个选中元素的索引（int64, 8字节），因此每个rank的实际通信字节数为：
+\begin{equation}
+B_{\text{hybrid}} = k \times (b_{\text{index}} + b_{\text{quant}}) + b_{\text{meta}},
+\label{eq:hybrid-bytes}
+\end{equation}
+其中$b_{\text{index}}=8$字节为int64索引开销，$b_{\text{quant}}$为量化后的单元素字节数（INT8为1字节，1-bit为$1/8$字节），$b_{\text{meta}}$为少量元数据（缩放因子或均值参数，通常$\le 8$字节）。对比无压缩的$B_{\text{baseline}} = n \times 4$字节（float32），有效压缩比为：
+\begin{equation}
+r_{\text{effective}} = \frac{n \times 4}{k \times (8 + b_{\text{quant}}) + b_{\text{meta}}}.
+\label{eq:hybrid-effective}
+\end{equation}
+
+以$n = 10^6$、$\rho = 0.01$为例，Top-k+INT8的有效压缩比为$4 \times 10^6 / (10^4 \times 9 + 4) \approx 44.4$倍，Top-k+1-bit为$4 \times 10^6 / (10^4 \times 8.125 + 8) \approx 49.2$倍。虽然因索引开销的存在，有效压缩比低于理论乘性值，但相比单一方法仍有数量级的提升。
+
+\subsection{通用混合压缩框架}
+
+本文设计并实现了一个通用的两阶段混合压缩框架，支持第一阶段稀疏化方法与第二阶段量化方法的任意组合。框架的核心抽象为：
+\begin{equation}
+\mathbf{c} = Q(S(\tilde{\mathbf{g}})), \quad \hat{\mathbf{g}} = D_Q(D_S(\mathbf{c})),
+\label{eq:hybrid-abstract}
+\end{equation}
+其中$S(\cdot)$为稀疏化算子，$Q(\cdot)$为量化算子，$D_S(\cdot)$和$D_Q(\cdot)$分别为对应的解码算子。$\tilde{\mathbf{g}} = \mathbf{g}_t + \mathbf{e}_t$为叠加了误差反馈残差的梯度。
+
+框架通过\texttt{HybridCompressState}状态类统一管理稀疏化方法（\texttt{sparse\_method}）、量化方法（\texttt{quant\_method}）、稀疏率（\texttt{ratio}）等超参数。当前实现支持以下5种组合：
+
+\begin{table}[htbp]
+\caption{两阶段混合压缩的组合方案}
+\label{tab:hybrid-combos}
+\vspace{0.5em}\centering\wuhao
+\begin{tabular}{llccc}
+\toprule
+组合名称 & Stage-1 $\to$ Stage-2 & 稀疏率$\rho$ & 每元素传输位宽 & 理论乘性压缩比 \\
+\midrule
+topk\_int8     & Top-k $\to$ INT8   & 0.01 & $8+64$ bits & $100 \times 4$ \\
+topk\_1bit     & Top-k $\to$ 1-bit  & 0.01 & $1+64$ bits & $100 \times 32$ \\
+thresholdv\_int8 & Threshold-v $\to$ INT8 & 0.01 & $8+64$ bits & $100 \times 4$ \\
+thresholdv\_1bit & Threshold-v $\to$ 1-bit & 0.01 & $1+64$ bits & $100 \times 32$ \\
+randomk\_int8  & Random-k $\to$ INT8 & 0.01 & $8+64$ bits & $100 \times 4$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{第一阶段：稀疏化}
+
+第一阶段稀疏化从梯度向量$\tilde{\mathbf{g}} \in \mathbb{R}^n$中选取$k$个重要元素，输出索引集合$\mathcal{I} \subseteq \{0, 1, \ldots, n-1\}$和对应的取值向量$\mathbf{v} \in \mathbb{R}^{|\mathcal{I}|}$。三种稀疏化方法的选取策略分别为：
+
+\textbf{Top-k选取：}按绝对值降序选取前$k$个坐标，保证信息量最大化。这是有偏操作，需配合误差反馈。
+
+\textbf{Threshold-v选取：}选取绝对值超过阈值$v$的坐标。当未显式指定阈值时，自适应地利用Top-k操作估计使得恰好保留$k$个元素的隐式阈值，并对超过$k$个的候选做二次筛选以严格控制通信量上界。
+
+\textbf{Random-k选取：}从$[n]$中均匀随机采样$k$个坐标，并将选中分量乘以缩放因子$n/k$以保持无偏性。由于选取不依赖梯度值分布，计算开销最低。
+
+\subsection{第二阶段：量化}
+
+第二阶段在稀疏化选出的$|\mathcal{I}|$个取值上进一步做低比特量化，有两种方案。
+
+\textbf{INT8对称量化：}沿用第3章的量化策略，对选中的取值向量$\mathbf{v}$计算局部缩放因子$s = q_{\max} / (\max|\mathbf{v}| + \epsilon)$，将$\mathbf{v}$量化为int8整数。每个选中元素传输1字节量化值和8字节int64索引，外加1个float32缩放因子。
+
+\textbf{1-bit符号量化：}仅保留选中取值的符号$\text{sign}(\mathbf{v}_i)$，并分别计算正分量均值$\mu^+$和负分量均值$\mu^-$作为重构参考值：
+\begin{equation}
+\mu^+ = \frac{1}{|\{i : \mathbf{v}_i > 0\}|} \sum_{i: \mathbf{v}_i > 0} \mathbf{v}_i, \quad
+\mu^- = \frac{1}{|\{i : \mathbf{v}_i < 0\}|} \sum_{i: \mathbf{v}_i < 0} \mathbf{v}_i.
+\label{eq:hybrid-1bit-mu}
+\end{equation}
+解码时根据符号选择$\mu^+$或$\mu^-$进行重构。每个选中元素传输1字节符号和8字节索引，外加2个float32均值参数。
+
+\subsection{通信模式}
+
+混合压缩后的紧凑表示通过\texttt{all\_gather\_into\_tensor}在所有rank之间交换。具体地，每个rank发送三份数据：索引张量（int64）、量化值张量（int8或int8符号）以及元数据张量（缩放因子或均值对）。接收端对每个rank的数据分别解码，再通过\texttt{index\_add\_}算子将所有rank的贡献叠加到全零初始化的全维度张量上，最后提取本rank对应的分片并除以world size得到平均梯度分片。
+
+需要注意的是，为保证\texttt{all\_gather}的输入张量在各rank间维度一致，当Threshold-v的实际选中元素数少于$k$时，需对索引和量化值做零填充（zero-padding），解码时填充位置的零值不影响\texttt{index\_add\_}的正确性。
+
+\subsection{误差反馈}
+
+混合压缩的两阶段级联引入了叠加的近似误差。设第一阶段的稀疏化误差为$\mathbf{e}_{\text{sparse}} = \tilde{\mathbf{g}} - S(\tilde{\mathbf{g}})$，第二阶段的量化误差为$\mathbf{e}_{\text{quant}} = S(\tilde{\mathbf{g}}) - D_Q(Q(S(\tilde{\mathbf{g}})))$，则总近似误差为：
+\begin{equation}
+\mathbf{e}_{\text{total}} = \mathbf{e}_{\text{sparse}} + \mathbf{e}_{\text{quant}} = \tilde{\mathbf{g}} - D_Q(Q(S(\tilde{\mathbf{g}}))).
+\label{eq:hybrid-error}
+\end{equation}
+在误差反馈框架下，残差更新为$\mathbf{e}_{t+1} = \tilde{\mathbf{g}}_t - \hat{\mathbf{g}}_t = \mathbf{e}_{\text{total}}$，保证被丢弃的信息在后续迭代中得到补偿。
+
+\section{自适应压缩调度}
+
+\subsection{设计动机}
+
+第4章的实验结果揭示了一个重要现象：在训练初期梯度幅值大且变化剧烈，压缩引入的相对误差对优化方向的干扰较小；而随着训练推进梯度趋于平缓，相同的绝对压缩误差所占的相对比例反而增大，对收敛精度的影响也随之显著。这一观察启发了在时间维度上动态调节压缩强度的思路——在不同训练阶段施加不同程度的压缩，以在全局范围内优化通信节省量与收敛质量之间的平衡。
+
+具体而言，自适应压缩调度的核心思想是将稀疏率$\rho$从固定常数推广为训练步数$t$或梯度统计量的函数$\rho(t)$：
+\begin{equation}
+\rho(t): \{0, 1, \ldots, T-1\} \to [\rho_{\min}, \rho_{\max}],
+\label{eq:adaptive-schedule}
+\end{equation}
+其中$T$为总训练步数，$\rho_{\min}$和$\rho_{\max}$分别为最小和最大稀疏率（即保留的元素占比）。$\rho$越小表示压缩越激进（保留元素越少），$\rho$越大表示压缩越温和。
+
+\subsection{调度策略}
+
+本文实现了三种调度策略，分别面向不同的训练场景。
+
+\subsubsection{Warmup-Decay调度}
+
+Warmup-Decay调度将训练过程划分为两个阶段。在预热阶段（$0 \le t < T_w$），稀疏率从$\rho_{\max}$线性下降至$\rho_{\min}$：
+\begin{equation}
+\rho_{\text{warmup}}(t) = \rho_{\max} - \frac{t}{T_w}(\rho_{\max} - \rho_{\min}), \quad t < T_w,
+\label{eq:warmup}
+\end{equation}
+其中$T_w = \lfloor \alpha \cdot T \rfloor$为预热步数，$\alpha$为预热比例（默认$\alpha = 0.1$）。预热阶段的直觉是：训练初期模型参数远离最优点，梯度方向的方差较大但幅值也大，保留更多元素有助于快速下降。
+
+在衰减阶段（$T_w \le t < T$），稀疏率按余弦函数从$\rho_{\min}$逐渐回升至中等水平$\rho_{\text{mid}} = (\rho_{\min} + \rho_{\max})/2$：
+\begin{equation}
+\rho_{\text{decay}}(t) = \rho_{\min} + (\rho_{\text{mid}} - \rho_{\min}) \cdot \left(1 - \frac{1}{2}\left(1 + \cos\frac{\pi(t - T_w)}{T - T_w}\right)\right), \quad t \ge T_w.
+\label{eq:decay}
+\end{equation}
+衰减阶段的直觉是：训练中期可容忍最强压缩以最大化通信节省，而训练后期适当放松压缩有助于微调阶段的精度收敛。
+
+\subsubsection{线性调度}
+
+线性调度提供最简单的基线方案，稀疏率从$\rho_{\max}$均匀线性下降至$\rho_{\min}$：
+\begin{equation}
+\rho_{\text{linear}}(t) = \rho_{\max} - \frac{t}{T}(\rho_{\max} - \rho_{\min}).
+\label{eq:linear-schedule}
+\end{equation}
+此策略的优势在于实现简单、行为可预测，适合作为消融实验中的对照组。
+
+\subsubsection{梯度自适应调度}
+
+与前两种基于训练步数的确定性调度不同，梯度自适应调度根据实时梯度统计量动态决定压缩强度。具体地，维护梯度$\ell_2$范数的指数移动平均（EMA）：
+\begin{equation}
+\bar{g}_t = \beta \cdot \|\mathbf{g}_t\|_2 + (1-\beta) \cdot \bar{g}_{t-1},
+\label{eq:grad-ema}
+\end{equation}
+其中$\beta = 0.1$为平滑系数，$\bar{g}_0 = 0$。当当前步梯度范数$\|\mathbf{g}_t\|_2$显著大于EMA $\bar{g}_t$时，说明当前梯度携带了重要信号，应减轻压缩以保留更多信息；反之则可加强压缩。
+
+稀疏率通过sigmoid映射从梯度范数比值映射到$[\rho_{\min}, \rho_{\max}]$区间：
+\begin{equation}
+\rho_{\text{grad}}(t) = \rho_{\min} + \frac{\rho_{\max} - \rho_{\min}}{1 + \exp\left(-2 \cdot \left(\frac{\|\mathbf{g}_t\|_2}{\bar{g}_t} - 1\right)\right)}.
+\label{eq:grad-adaptive}
+\end{equation}
+
+当$\|\mathbf{g}_t\|_2 / \bar{g}_t \gg 1$时，sigmoid输出趋近1，$\rho \to \rho_{\max}$（轻压缩）；当$\|\mathbf{g}_t\|_2 / \bar{g}_t \ll 1$时，sigmoid输出趋近0，$\rho \to \rho_{\min}$（强压缩）。这种设计使得压缩策略能够自动适应训练过程中梯度信号强度的变化。
+
+\subsection{与混合压缩的集成}
+
+自适应调度器在实现层面作为外层包装器，内部调用稀疏化方法（Top-k、Random-k或Threshold-v）完成实际的元素选取，并固定使用INT8作为第二阶段量化。每次hook调用时，调度器首先根据当前步数和/或梯度范数计算$\rho(t)$，据此确定$k = \lfloor \rho(t) \cdot n \rfloor$，再执行稀疏化与量化的两阶段流程。
+
+\texttt{AdaptiveCompressState}状态类中维护以下运行时信息：（1）全局步数计数器\texttt{\_step}，每次hook调用后自增；（2）梯度范数EMA \texttt{\_grad\_norm\_ema}，用于\texttt{grad\_adaptive}策略；（3）调度函数的参数（总步数、预热比例、最小/最大稀疏率等）。这些状态量的存储开销可忽略不计。
+
+\subsection{复杂度分析}
+
+自适应调度的额外开销来自两部分：（1）梯度$\ell_2$范数计算，复杂度$O(n)$，可与梯度tensor的其他操作融合；（2）调度函数求值，仅涉及标量运算，复杂度$O(1)$。相比于稀疏化本身的$O(n \log k)$排序开销和通信延迟，调度器引入的额外计算可忽略不计。
+
+\section{实现细节}
+
+\subsection{模块注册}
+
+新的混合压缩与自适应调度通过统一的\texttt{build\_comm\_hook}注册函数接入训练流程。使用者通过\texttt{--comm-hook}命令行参数指定算法名称即可切换：
+
+\begin{table}[htbp]
+\caption{新增通信压缩算法的注册名称与参数}
+\label{tab:new-hooks}
+\vspace{0.5em}\centering\wuhao
+\begin{tabular}{llp{6cm}}
+\toprule
+注册名称 & 类型 & 关键命令行参数 \\
+\midrule
+\texttt{hybrid\_topk\_1bit} & 混合 & \texttt{--topk-ratio} \\
+\texttt{hybrid\_thresholdv\_int8} & 混合 & \texttt{--threshold-ratio} \\
+\texttt{hybrid\_thresholdv\_1bit} & 混合 & \texttt{--threshold-ratio} \\
+\texttt{hybrid\_randomk\_int8} & 混合 & \texttt{--randomk-ratio} \\
+\texttt{adaptive} & 自适应 & \texttt{--adaptive-schedule}, \texttt{--adaptive-total-steps}, \texttt{--adaptive-min-ratio}, \texttt{--adaptive-max-ratio} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{通信字节追踪}
+
+为便于后续效率分析，每次通信调用后均记录本rank发送的实际字节数。混合压缩记录$k \times (8 + b_{\text{quant}}) + b_{\text{meta}}$字节，自适应调度记录的字节数随$\rho(t)$的变化而动态变化。
+
+\section{本章小结}
+
+本章从两个维度对通信压缩方法进行了扩展。两阶段混合压缩通过稀疏化与量化的级联组合实现乘性压缩比，在Top-k+INT8的默认配置下可达约44倍有效压缩，Top-k+1-bit可达约49倍，远超单一方法的上限。自适应压缩调度则在时间维度上引入动态调节机制，通过Warmup-Decay、线性和梯度自适应三种策略，根据训练阶段特点灵活调整压缩强度，在保持整体收敛质量的同时最大化通信节省量。两者均在统一的FSDP通信钩子框架下实现，与已有的9种压缩算法无缝兼容，扩展了通信压缩方法的设计空间。
+
