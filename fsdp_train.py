@@ -91,7 +91,7 @@ def main():
         '--comm-hook',
         type=str,
         default='none',
-        help='FSDP 通信压缩 hook: none, int8, fp16, qsgd, signsgd, onebit, onebit_seide, nc, topk, randomk, thresholdv, sketch, hybrid_topk_int8',
+        help='FSDP 通信压缩 hook: none, int8, fp16, qsgd, signsgd, onebit, onebit_seide, nc, topk, randomk, thresholdv, sketch, hybrid_topk_int8, hybrid_topk_1bit, hybrid_thresholdv_int8, hybrid_thresholdv_1bit, hybrid_randomk_int8, hybrid, adaptive',
     )
     parser.add_argument('--comm-onebit-col-size', type=int, default=256, help='1-bit Seide 按列重建时的列大小')
     parser.add_argument('--comm-int8-variant', type=str, default='linear', choices=['linear', 'dynamic_tree'], help='INT8 变体: linear 或 dynamic_tree')
@@ -138,6 +138,29 @@ def main():
     parser.add_argument('--comm-threshold-v', type=float, default=0.0, help='Threshold-v 正侧阈值 v_pos（0 则用 ratio 分位数）')
     parser.add_argument('--comm-threshold-v-neg', type=float, default=None, help='Threshold-v 负侧阈值 v_neg（缺省与 v 对称）')
     parser.add_argument('--comm-sketch-two-round', action='store_true', help='Sketched-SGD 两轮通信 + HEAVYMIX')
+
+    # --- 混合两阶段压缩参数 ---
+    parser.add_argument('--comm-hybrid-sparse-method', type=str, default='topk',
+                        choices=['topk', 'thresholdv', 'randomk'],
+                        help='混合压缩的第一阶段稀疏化方法')
+    parser.add_argument('--comm-hybrid-quant-method', type=str, default='int8',
+                        choices=['int8', '1bit'],
+                        help='混合压缩的第二阶段量化方法')
+    # --- 自适应压缩调度参数 ---
+    parser.add_argument('--comm-adaptive-base-hook', type=str, default='topk',
+                        choices=['topk', 'randomk', 'thresholdv', 'hybrid'],
+                        help='自适应调度的内部稀疏化方法')
+    parser.add_argument('--comm-adaptive-schedule', type=str, default='warmup_decay',
+                        choices=['warmup_decay', 'step_linear', 'grad_adaptive'],
+                        help='自适应调度策略')
+    parser.add_argument('--comm-adaptive-total-steps', type=int, default=0,
+                        help='自适应调度的总步数（0=自动从训练配置推断）')
+    parser.add_argument('--comm-adaptive-warmup-fraction', type=float, default=0.1,
+                        help='Warmup-Decay 策略的预热比例')
+    parser.add_argument('--comm-adaptive-min-ratio', type=float, default=0.001,
+                        help='自适应调度的最小稀疏率（最强压缩）')
+    parser.add_argument('--comm-adaptive-max-ratio', type=float, default=0.1,
+                        help='自适应调度的最大稀疏率（最轻压缩）')
 
     # --- Step1/取证：耗时 profiling 与短跑 ---
     parser.add_argument(
@@ -222,6 +245,16 @@ def main():
         onebit_col_size=getattr(args, 'comm_onebit_col_size', 256),
         signsgd_use_delta=getattr(args, 'comm_signsgd_use_delta', False),
         onebit_use_cpp=getattr(args, 'comm_onebit_use_cpp', True),
+        # 混合压缩参数
+        hybrid_sparse_method=getattr(args, 'comm_hybrid_sparse_method', 'topk'),
+        hybrid_quant_method=getattr(args, 'comm_hybrid_quant_method', 'int8'),
+        # 自适应调度参数
+        adaptive_base_hook=getattr(args, 'comm_adaptive_base_hook', 'topk'),
+        adaptive_schedule=getattr(args, 'comm_adaptive_schedule', 'warmup_decay'),
+        adaptive_total_steps=getattr(args, 'comm_adaptive_total_steps', 0) or 200,
+        adaptive_warmup_fraction=getattr(args, 'comm_adaptive_warmup_fraction', 0.1),
+        adaptive_min_ratio=getattr(args, 'comm_adaptive_min_ratio', 0.001),
+        adaptive_max_ratio=getattr(args, 'comm_adaptive_max_ratio', 0.1),
     )
     if comm_hook is not None and world_size > 1:
         logger.info(f"🔧 注册通信压缩 hook: {args.comm_hook}")
@@ -273,6 +306,14 @@ def main():
         num_warmup_steps=args.warmup_steps,
         num_training_steps=total_steps
     )
+
+    # 补设自适应调度器的 total_steps（如果用户未显式指定）
+    if comm_state is not None and hasattr(comm_state, 'total_steps'):
+        effective_steps = args.max_steps if args.max_steps > 0 else total_steps
+        if getattr(args, 'comm_adaptive_total_steps', 0) == 0:
+            comm_state.total_steps = effective_steps
+            if rank == 0:
+                logger.info(f"[adaptive] auto-set total_steps={effective_steps}")
     logger.info(f"总训练步数: {total_steps}, 预热步数: {args.warmup_steps}")
     logger.info(f"总训练步数: {total_steps}")
     logger.info(f"每个epoch步数: {len(dataloader)}")
