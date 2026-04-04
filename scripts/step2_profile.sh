@@ -65,6 +65,17 @@ COMM_SIGNSGD_USE_DELTA=""
 COMM_SKETCH_TWO_ROUND=""
 COMM_NC_BIT_PACKING=1
 
+# ---- 混合压缩 (hybrid) ----
+COMM_HYBRID_SPARSE_METHOD="topk"    # topk / thresholdv / randomk
+COMM_HYBRID_QUANT_METHOD="int8"     # int8 / 1bit
+# ---- 自适应调度 (adaptive) ----
+COMM_ADAPTIVE_BASE_HOOK="topk"      # topk / randomk / thresholdv / hybrid
+COMM_ADAPTIVE_SCHEDULE="warmup_decay"  # warmup_decay / step_linear / grad_adaptive
+COMM_ADAPTIVE_TOTAL_STEPS=0         # 0 = 使用 max_steps
+COMM_ADAPTIVE_WARMUP_FRACTION=0.1
+COMM_ADAPTIVE_MIN_RATIO=0.001
+COMM_ADAPTIVE_MAX_RATIO=0.1
+
 PASSTHROUGH=()
 
 while [[ $# -gt 0 ]]; do
@@ -137,6 +148,22 @@ while [[ $# -gt 0 ]]; do
       COMM_SKETCH_TWO_ROUND=1; shift 1 ;;
     --no_comm_nc_bit_packing)
       COMM_NC_BIT_PACKING=""; shift 1 ;;
+    --comm_hybrid_sparse_method)
+      COMM_HYBRID_SPARSE_METHOD="$2"; shift 2 ;;
+    --comm_hybrid_quant_method)
+      COMM_HYBRID_QUANT_METHOD="$2"; shift 2 ;;
+    --comm_adaptive_base_hook)
+      COMM_ADAPTIVE_BASE_HOOK="$2"; shift 2 ;;
+    --comm_adaptive_schedule)
+      COMM_ADAPTIVE_SCHEDULE="$2"; shift 2 ;;
+    --comm_adaptive_total_steps)
+      COMM_ADAPTIVE_TOTAL_STEPS="$2"; shift 2 ;;
+    --comm_adaptive_warmup_fraction)
+      COMM_ADAPTIVE_WARMUP_FRACTION="$2"; shift 2 ;;
+    --comm_adaptive_min_ratio)
+      COMM_ADAPTIVE_MIN_RATIO="$2"; shift 2 ;;
+    --comm_adaptive_max_ratio)
+      COMM_ADAPTIVE_MAX_RATIO="$2"; shift 2 ;;
     --)
       shift
       PASSTHROUGH+=("$@")
@@ -190,6 +217,14 @@ cat > "$LOG_DIR/config.json" << EOF
   "comm_onebit_col_size": ${COMM_ONEBIT_COL_SIZE},
   "comm_onebit_use_cpp": $([ -n "$COMM_ONEBIT_USE_CPP" ] && echo true || echo false),
   "comm_nc_bit_packing": $([ -n "$COMM_NC_BIT_PACKING" ] && echo true || echo false),
+  "comm_hybrid_sparse_method": "${COMM_HYBRID_SPARSE_METHOD}",
+  "comm_hybrid_quant_method": "${COMM_HYBRID_QUANT_METHOD}",
+  "comm_adaptive_base_hook": "${COMM_ADAPTIVE_BASE_HOOK}",
+  "comm_adaptive_schedule": "${COMM_ADAPTIVE_SCHEDULE}",
+  "comm_adaptive_total_steps": ${COMM_ADAPTIVE_TOTAL_STEPS},
+  "comm_adaptive_warmup_fraction": ${COMM_ADAPTIVE_WARMUP_FRACTION},
+  "comm_adaptive_min_ratio": ${COMM_ADAPTIVE_MIN_RATIO},
+  "comm_adaptive_max_ratio": ${COMM_ADAPTIVE_MAX_RATIO},
   "timestamp": "$(date -Iseconds)"
 }
 EOF
@@ -209,6 +244,16 @@ COMM_EXTRA+=(--comm-onebit-col-size "$COMM_ONEBIT_COL_SIZE")
 [[ -n "$COMM_SIGNSGD_USE_DELTA" ]] && COMM_EXTRA+=(--comm-signsgd-use-delta)
 [[ -n "$COMM_SKETCH_TWO_ROUND" ]] && COMM_EXTRA+=(--comm-sketch-two-round)
 [[ -n "$COMM_NC_BIT_PACKING" ]] && COMM_EXTRA+=(--comm-nc-bit-packing) || COMM_EXTRA+=(--no-comm-nc-bit-packing)
+# ---- hybrid / adaptive 参数 ----
+COMM_EXTRA+=(--comm-hybrid-sparse-method "$COMM_HYBRID_SPARSE_METHOD")
+COMM_EXTRA+=(--comm-hybrid-quant-method "$COMM_HYBRID_QUANT_METHOD")
+COMM_EXTRA+=(--comm-adaptive-base-hook "$COMM_ADAPTIVE_BASE_HOOK")
+COMM_EXTRA+=(--comm-adaptive-schedule "$COMM_ADAPTIVE_SCHEDULE")
+COMM_EXTRA+=(--comm-adaptive-total-steps "$COMM_ADAPTIVE_TOTAL_STEPS")
+COMM_EXTRA+=(--comm-adaptive-warmup-fraction "$COMM_ADAPTIVE_WARMUP_FRACTION")
+COMM_EXTRA+=(--comm-adaptive-min-ratio "$COMM_ADAPTIVE_MIN_RATIO")
+COMM_EXTRA+=(--comm-adaptive-max-ratio "$COMM_ADAPTIVE_MAX_RATIO")
+
 
 BASE_ARGS=(
   fsdp_train.py

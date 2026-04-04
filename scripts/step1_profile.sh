@@ -35,6 +35,14 @@ Step1: 一键启动耗时取证（torch.profiler + step wall time + overlap）
   --no_comm_onebit_use_cpp    关闭 1-bit Seide 的 C++/CUDA 扩展（默认开启）
   --comm_signsgd_use_delta    SignSGD 仅传方向、步长用 lr
   --comm_sketch_two_round     Sketched-SGD 两轮 + HEAVYMIX
+  --comm_hybrid_sparse_method M   混合压缩 Stage-1 稀疏方法（topk/thresholdv/randomk，默认 topk）
+  --comm_hybrid_quant_method M    混合压缩 Stage-2 量化方法（int8/1bit，默认 int8）
+  --comm_adaptive_base_hook H     自适应底层压缩算法（topk/randomk/thresholdv/hybrid，默认 topk）
+  --comm_adaptive_schedule S      自适应调度策略（warmup_decay/step_linear/grad_adaptive，默认 warmup_decay）
+  --comm_adaptive_total_steps N   自适应总步数（0=使用 max_steps，默认 0）
+  --comm_adaptive_warmup_fraction F  预热阶段占比（默认 0.1）
+  --comm_adaptive_min_ratio R     最小稀疏率（默认 0.001）
+  --comm_adaptive_max_ratio R     最大稀疏率（默认 0.1）
   其他压缩参数可通过 -- 透传，例如: -- --comm-error-feedback
 
 产物：
@@ -163,6 +171,22 @@ while [[ $# -gt 0 ]]; do
       COMM_SKETCH_TWO_ROUND=1; shift 1 ;;
     --no_comm_nc_bit_packing)
       COMM_NC_BIT_PACKING=""; shift 1 ;;
+    --comm_hybrid_sparse_method)
+      COMM_HYBRID_SPARSE_METHOD="$2"; shift 2 ;;
+    --comm_hybrid_quant_method)
+      COMM_HYBRID_QUANT_METHOD="$2"; shift 2 ;;
+    --comm_adaptive_base_hook)
+      COMM_ADAPTIVE_BASE_HOOK="$2"; shift 2 ;;
+    --comm_adaptive_schedule)
+      COMM_ADAPTIVE_SCHEDULE="$2"; shift 2 ;;
+    --comm_adaptive_total_steps)
+      COMM_ADAPTIVE_TOTAL_STEPS="$2"; shift 2 ;;
+    --comm_adaptive_warmup_fraction)
+      COMM_ADAPTIVE_WARMUP_FRACTION="$2"; shift 2 ;;
+    --comm_adaptive_min_ratio)
+      COMM_ADAPTIVE_MIN_RATIO="$2"; shift 2 ;;
+    --comm_adaptive_max_ratio)
+      COMM_ADAPTIVE_MAX_RATIO="$2"; shift 2 ;;
     --)
       shift
       PASSTHROUGH+=("$@")
@@ -218,6 +242,14 @@ cat > "$LOG_DIR/config.json" << EOF
   "comm_onebit_col_size": ${COMM_ONEBIT_COL_SIZE},
   "comm_onebit_use_cpp": $([ -n "$COMM_ONEBIT_USE_CPP" ] && echo true || echo false),
   "comm_nc_bit_packing": $([ -n "$COMM_NC_BIT_PACKING" ] && echo true || echo false),
+  "comm_hybrid_sparse_method": "${COMM_HYBRID_SPARSE_METHOD}",
+  "comm_hybrid_quant_method": "${COMM_HYBRID_QUANT_METHOD}",
+  "comm_adaptive_base_hook": "${COMM_ADAPTIVE_BASE_HOOK}",
+  "comm_adaptive_schedule": "${COMM_ADAPTIVE_SCHEDULE}",
+  "comm_adaptive_total_steps": ${COMM_ADAPTIVE_TOTAL_STEPS},
+  "comm_adaptive_warmup_fraction": ${COMM_ADAPTIVE_WARMUP_FRACTION},
+  "comm_adaptive_min_ratio": ${COMM_ADAPTIVE_MIN_RATIO},
+  "comm_adaptive_max_ratio": ${COMM_ADAPTIVE_MAX_RATIO},
   "timestamp": "$(date -Iseconds)"
 }
 EOF
@@ -238,6 +270,16 @@ COMM_EXTRA+=(--comm-onebit-col-size "$COMM_ONEBIT_COL_SIZE")
 [[ -n "$COMM_SIGNSGD_USE_DELTA" ]] && COMM_EXTRA+=(--comm-signsgd-use-delta)
 [[ -n "$COMM_SKETCH_TWO_ROUND" ]] && COMM_EXTRA+=(--comm-sketch-two-round)
 [[ -n "$COMM_NC_BIT_PACKING" ]] && COMM_EXTRA+=(--comm-nc-bit-packing) || COMM_EXTRA+=(--no-comm-nc-bit-packing)
+# ---- hybrid / adaptive 参数 ----
+COMM_EXTRA+=(--comm-hybrid-sparse-method "$COMM_HYBRID_SPARSE_METHOD")
+COMM_EXTRA+=(--comm-hybrid-quant-method "$COMM_HYBRID_QUANT_METHOD")
+COMM_EXTRA+=(--comm-adaptive-base-hook "$COMM_ADAPTIVE_BASE_HOOK")
+COMM_EXTRA+=(--comm-adaptive-schedule "$COMM_ADAPTIVE_SCHEDULE")
+COMM_EXTRA+=(--comm-adaptive-total-steps "$COMM_ADAPTIVE_TOTAL_STEPS")
+COMM_EXTRA+=(--comm-adaptive-warmup-fraction "$COMM_ADAPTIVE_WARMUP_FRACTION")
+COMM_EXTRA+=(--comm-adaptive-min-ratio "$COMM_ADAPTIVE_MIN_RATIO")
+COMM_EXTRA+=(--comm-adaptive-max-ratio "$COMM_ADAPTIVE_MAX_RATIO")
+
 
 # NOTE: torchrun expects the training script/module directly (e.g. fsdp_train.py),
 # not a nested "python fsdp_train.py" command.

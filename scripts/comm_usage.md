@@ -223,3 +223,74 @@ FSDP 对每个参数的梯度做一次 reduce_scatter（以及若开 EF 则再�
 `total_sent = sum(p.numel() * 4 * 2 for p in model.parameters() if p.numel() % world_size == 0)`（实际还需加上不能整除的边界处理）。  
 把这段逻辑放到训练前或单独的分析脚本里即可得到「每 step 单 rank 发送字节数」；再乘 step 数即得整次训练的通信量。
 
+
+### 混合两阶段压缩（Hybrid: 稀疏 + 量化）
+
+混合压缩先做 Stage-1 稀疏化（Top-k / Threshold-v / Random-k），再对稀疏值做 Stage-2 量化（INT8 / 1-bit），实现乘法级压缩比。
+
+**Top-k + INT8（推荐）**：
+```bash
+$BASE --comm_hook hybrid_topk_int8_v2 --comm_topk_ratio 0.01 --comm_error_feedback --comm_ef_local
+```
+
+**Top-k + 1-bit**：
+```bash
+$BASE --comm_hook hybrid_topk_1bit --comm_topk_ratio 0.01 --comm_error_feedback --comm_ef_local
+```
+
+**Threshold-v + INT8**：
+```bash
+$BASE --comm_hook hybrid_thresholdv_int8 --comm_topk_ratio 0.01 --comm_error_feedback --comm_ef_local
+```
+
+**Threshold-v + 1-bit**：
+```bash
+$BASE --comm_hook hybrid_thresholdv_1bit --comm_topk_ratio 0.01 --comm_error_feedback --comm_ef_local
+```
+
+**Random-k + INT8**：
+```bash
+$BASE --comm_hook hybrid_randomk_int8 --comm_topk_ratio 0.01 --comm_error_feedback --comm_ef_local
+```
+
+> 混合压缩使用已有的 `--comm_topk_ratio` 控制 Stage-1 稀疏率。可通过 `--comm_hybrid_sparse_method` 和 `--comm_hybrid_quant_method` 显式指定方法（通常由 hook 名自动决定）。
+
+### 自适应压缩调度（Adaptive Scheduling）
+
+自适应调度根据训练进度动态调整稀疏比例，在训练早期使用较高压缩率加速通信，后期降低压缩率保证收敛质量。
+
+**Warmup-Decay 策略（推荐）**：
+```bash
+$BASE --comm_hook adaptive --comm_adaptive_schedule warmup_decay \
+  --comm_adaptive_base_hook topk \
+  --comm_adaptive_total_steps 200 \
+  --comm_adaptive_warmup_fraction 0.1 \
+  --comm_adaptive_min_ratio 0.001 --comm_adaptive_max_ratio 0.1 \
+  --comm_error_feedback --comm_ef_local
+```
+
+**Linear 线性衰减策略**：
+```bash
+$BASE --comm_hook adaptive --comm_adaptive_schedule step_linear \
+  --comm_adaptive_base_hook topk \
+  --comm_adaptive_total_steps 200 \
+  --comm_adaptive_min_ratio 0.001 --comm_adaptive_max_ratio 0.1 \
+  --comm_error_feedback --comm_ef_local
+```
+
+**Grad-adaptive 梯度自适应策略**：
+```bash
+$BASE --comm_hook adaptive --comm_adaptive_schedule grad_adaptive \
+  --comm_adaptive_base_hook topk \
+  --comm_adaptive_total_steps 200 \
+  --comm_adaptive_min_ratio 0.001 --comm_adaptive_max_ratio 0.1 \
+  --comm_error_feedback --comm_ef_local
+```
+
+> **参数说明**：
+> - `--comm_adaptive_base_hook`：底层压缩算法（topk / randomk / thresholdv / hybrid）
+> - `--comm_adaptive_schedule`：调度策略（warmup_decay / step_linear / grad_adaptive）
+> - `--comm_adaptive_total_steps`：总训练步数，0 表示自动使用 max_steps
+> - `--comm_adaptive_warmup_fraction`：warmup_decay 策略的预热阶段占比
+> - `--comm_adaptive_min_ratio / --comm_adaptive_max_ratio`：稀疏率动态范围
+
