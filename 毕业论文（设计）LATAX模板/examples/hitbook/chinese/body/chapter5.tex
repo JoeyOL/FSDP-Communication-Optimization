@@ -10,25 +10,25 @@
 
 \subsection{设计动机}
 
-考虑Top-k稀疏化（$\rho=0.01$）与INT8量化的级联组合：第一阶段Top-k将需要传输的元素数量从$n$降至$k = \rho \cdot n$，第二阶段INT8将每个选中元素的表示位宽从32比特降至8比特。两阶段的压缩效果具有乘性关系：
+考虑Top-k稀疏化（$\rho=0.01$）与int8量化的级联组合：第一阶段Top-k将需要传输的元素数量从$n$降至$k = \rho \cdot n$，第二阶段int8将每个选中元素的表示位宽从32比特降至8比特。两阶段的压缩效果具有乘性关系：
 \begin{equation}
 r_{\text{total}} = r_{\text{sparse}} \times r_{\text{quant}} = \frac{1}{\rho} \times \frac{32}{8} = 100 \times 4 = 400.
 \label{eq:hybrid-ratio}
 \end{equation}
-其中$r_{\text{sparse}}$为稀疏化压缩比，$r_{\text{quant}}$为量化压缩比。若将量化方式从INT8替换为1-bit编码（仅保留符号位），则$r_{\text{quant}} = 32$，总压缩比可达$100 \times 32 = 3200$倍。
+其中$r_{\text{sparse}}$为稀疏化压缩比，$r_{\text{quant}}$为量化压缩比。若将量化方式从int8替换为1-bit编码（仅保留符号位），则$r_{\text{quant}} = 32$，总压缩比可达$100 \times 32 = 3200$倍。
 
 在实际通信中，还需额外传输每个选中元素的索引（int64, 8字节），因此每个rank的实际通信字节数为：
 \begin{equation}
 B_{\text{hybrid}} = k \times (b_{\text{index}} + b_{\text{quant}}) + b_{\text{meta}},
 \label{eq:hybrid-bytes}
 \end{equation}
-其中$b_{\text{index}}=8$字节为int64索引开销，$b_{\text{quant}}$为量化后的单元素字节数（INT8为1字节，1-bit为$1/8$字节），$b_{\text{meta}}$为少量元数据（缩放因子或均值参数，通常$\le 8$字节）。对比无压缩的$B_{\text{baseline}} = n \times 4$字节（float32），有效压缩比为：
+其中$b_{\text{index}}=8$字节为int64索引开销，$b_{\text{quant}}$为量化后的单元素字节数（int8为1字节，1-bit为$1/8$字节），$b_{\text{meta}}$为少量元数据（缩放因子或均值参数，通常$\le 8$字节）。对比无压缩的$B_{\text{baseline}} = n \times 4$字节（float32），有效压缩比为：
 \begin{equation}
 r_{\text{effective}} = \frac{n \times 4}{k \times (8 + b_{\text{quant}}) + b_{\text{meta}}}.
 \label{eq:hybrid-effective}
 \end{equation}
 
-以$n = 10^6$、$\rho = 0.01$为例，Top-k+INT8的有效压缩比为$4 \times 10^6 / (10^4 \times 9 + 4) \approx 44.4$倍，Top-k+1-bit为$4 \times 10^6 / (10^4 \times 8.125 + 8) \approx 49.2$倍。虽然因索引开销的存在，有效压缩比低于理论乘性值，但相比单一方法仍有数量级的提升。
+以$n = 10^6$、$\rho = 0.01$为例，Top-k+int8的有效压缩比为$4 \times 10^6 / (10^4 \times 9 + 4) \approx 44.4$倍，Top-k+1-bit为$4 \times 10^6 / (10^4 \times 8.125 + 8) \approx 49.2$倍。虽然因索引开销的存在，有效压缩比低于理论乘性值，但相比单一方法仍有数量级的提升。
 
 \subsection{通用混合压缩框架}
 
@@ -49,11 +49,11 @@ r_{\text{effective}} = \frac{n \times 4}{k \times (8 + b_{\text{quant}}) + b_{\t
 \toprule
 组合名称 & Stage-1 $\to$ Stage-2 & 稀疏率$\rho$ & 每元素传输位宽 & 理论乘性压缩比 \\
 \midrule
-topk\_int8     & Top-k $\to$ INT8   & 0.01 & $8+64$ bits & $100 \times 4$ \\
+topk\_int8     & Top-k $\to$ int8   & 0.01 & $8+64$ bits & $100 \times 4$ \\
 topk\_1bit     & Top-k $\to$ 1-bit  & 0.01 & $1+64$ bits & $100 \times 32$ \\
-thresholdv\_int8 & Threshold-v $\to$ INT8 & 0.01 & $8+64$ bits & $100 \times 4$ \\
+thresholdv\_int8 & Threshold-v $\to$ int8 & 0.01 & $8+64$ bits & $100 \times 4$ \\
 thresholdv\_1bit & Threshold-v $\to$ 1-bit & 0.01 & $1+64$ bits & $100 \times 32$ \\
-randomk\_int8  & Random-k $\to$ INT8 & 0.01 & $8+64$ bits & $100 \times 4$ \\
+randomk\_int8  & Random-k $\to$ int8 & 0.01 & $8+64$ bits & $100 \times 4$ \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -72,7 +72,7 @@ randomk\_int8  & Random-k $\to$ INT8 & 0.01 & $8+64$ bits & $100 \times 4$ \\
 
 第二阶段在稀疏化选出的$|\mathcal{I}|$个取值上进一步做低比特量化，有两种方案。
 
-\textbf{INT8对称量化：}沿用第3章的量化策略，对选中的取值向量$\mathbf{v}$计算局部缩放因子$s = q_{\max} / (\max|\mathbf{v}| + \epsilon)$，将$\mathbf{v}$量化为int8整数。每个选中元素传输1字节量化值和8字节int64索引，外加1个float32缩放因子。
+\textbf{int8对称量化：}沿用第3章的量化策略，对选中的取值向量$\mathbf{v}$计算局部缩放因子$s = q_{\max} / (\max|\mathbf{v}| + \epsilon)$，将$\mathbf{v}$量化为int8整数。每个选中元素传输1字节量化值和8字节int64索引，外加1个float32缩放因子。
 
 \textbf{1-bit符号量化：}仅保留选中取值的符号$\text{sign}(\mathbf{v}_i)$，并分别计算正分量均值$\mu^+$和负分量均值$\mu^-$作为重构参考值：
 \begin{equation}
@@ -158,7 +158,7 @@ Warmup-Decay调度将训练过程划分为两个阶段。在预热阶段（$0 \l
 
 \subsection{与混合压缩的集成}
 
-自适应调度器在实现层面作为外层包装器，内部调用稀疏化方法（Top-k、Random-k或Threshold-v）完成实际的元素选取，并固定使用INT8作为第二阶段量化。每次hook调用时，调度器首先根据当前步数和/或梯度范数计算$\rho(t)$，据此确定$k = \lfloor \rho(t) \cdot n \rfloor$，再执行稀疏化与量化的两阶段流程。
+自适应调度器在实现层面作为外层包装器，内部调用稀疏化方法（Top-k、Random-k或Threshold-v）完成实际的元素选取，并固定使用int8作为第二阶段量化。每次hook调用时，调度器首先根据当前步数和/或梯度范数计算$\rho(t)$，据此确定$k = \lfloor \rho(t) \cdot n \rfloor$，再执行稀疏化与量化的两阶段流程。
 
 \texttt{AdaptiveCompressState}状态类中维护以下运行时信息：（1）全局步数计数器\texttt{\_step}，每次hook调用后自增；（2）梯度范数EMA \texttt{\_grad\_norm\_ema}，用于\texttt{grad\_adaptive}策略；（3）调度函数的参数（总步数、预热比例、最小/最大稀疏率等）。这些状态量的存储开销可忽略不计。
 
@@ -195,5 +195,5 @@ Warmup-Decay调度将训练过程划分为两个阶段。在预热阶段（$0 \l
 
 \section{本章小结}
 
-本章从两个维度对通信压缩方法进行了扩展。两阶段混合压缩通过稀疏化与量化的级联组合实现乘性压缩比，在Top-k+INT8的默认配置下可达约44倍有效压缩，Top-k+1-bit可达约49倍，远超单一方法的上限。自适应压缩调度则在时间维度上引入动态调节机制，通过Warmup-Decay、线性和梯度自适应三种策略，根据训练阶段特点灵活调整压缩强度，在保持整体收敛质量的同时最大化通信节省量。两者均在统一的FSDP通信钩子框架下实现，与已有的9种压缩算法无缝兼容，扩展了通信压缩方法的设计空间。
+本章从两个维度对通信压缩方法进行了扩展。两阶段混合压缩通过稀疏化与量化的级联组合实现乘性压缩比，在Top-k+int8的默认配置下可达约44倍有效压缩，Top-k+1-bit可达约49倍，远超单一方法的上限。自适应压缩调度则在时间维度上引入动态调节机制，通过Warmup-Decay、线性和梯度自适应三种策略，根据训练阶段特点灵活调整压缩强度，在保持整体收敛质量的同时最大化通信节省量。两者均在统一的FSDP通信钩子框架下实现，与已有的9种压缩算法无缝兼容，扩展了通信压缩方法的设计空间。
 
