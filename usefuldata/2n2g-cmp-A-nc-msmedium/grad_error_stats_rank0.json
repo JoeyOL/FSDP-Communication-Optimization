@@ -1,0 +1,12 @@
+{
+  "by_hook": [
+    {
+      "name": "nc",
+      "rel_l2_last": NaN,
+      "rel_l2_mean": NaN,
+      "rel_l2_max": Infinity,
+      "rel_l2_std": 0.0,
+      "samples": 1275
+    }
+  ]
+}

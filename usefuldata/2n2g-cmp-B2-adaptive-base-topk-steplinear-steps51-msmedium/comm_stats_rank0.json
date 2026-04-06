@@ -1,0 +1,12 @@
+{
+  "step_count": 51,
+  "total_bytes_per_rank": 474899127,
+  "bytes_per_step_per_rank": 9311747,
+  "by_hook": [
+    {
+      "name": "adaptive",
+      "bytes_this_step": 3193498,
+      "bytes_total": 474899127
+    }
+  ]
+}

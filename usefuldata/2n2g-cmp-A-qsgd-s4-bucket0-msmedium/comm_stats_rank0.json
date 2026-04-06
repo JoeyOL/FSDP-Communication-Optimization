@@ -1,0 +1,12 @@
+{
+  "step_count": 51,
+  "total_bytes_per_rank": 9048131544,
+  "bytes_per_step_per_rank": 177414344,
+  "by_hook": [
+    {
+      "name": "qsgd",
+      "bytes_this_step": 177414344,
+      "bytes_total": 9048131544
+    }
+  ]
+}

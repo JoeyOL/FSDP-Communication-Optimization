@@ -1,0 +1,12 @@
+{
+  "step_count": 51,
+  "total_bytes_per_rank": 72384970752,
+  "bytes_per_step_per_rank": 1419313152,
+  "by_hook": [
+    {
+      "name": "sketch",
+      "bytes_this_step": 1419313152,
+      "bytes_total": 72384970752
+    }
+  ]
+}

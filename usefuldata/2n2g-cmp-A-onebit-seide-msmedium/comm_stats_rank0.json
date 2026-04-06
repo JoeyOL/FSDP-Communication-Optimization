@@ -1,0 +1,12 @@
+{
+  "step_count": 51,
+  "total_bytes_per_rank": 2827537920,
+  "bytes_per_step_per_rank": 55441920,
+  "by_hook": [
+    {
+      "name": "onebit_seide",
+      "bytes_this_step": 55441920,
+      "bytes_total": 2827537920
+    }
+  ]
+}

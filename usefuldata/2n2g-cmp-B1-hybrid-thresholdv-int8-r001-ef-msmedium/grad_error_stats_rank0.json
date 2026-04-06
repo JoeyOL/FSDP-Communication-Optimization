@@ -1,0 +1,12 @@
+{
+  "by_hook": [
+    {
+      "name": "hybrid_thresholdv_int8",
+      "rel_l2_last": 0.3932950076847197,
+      "rel_l2_mean": 0.7640370126263379,
+      "rel_l2_max": 1.5543054593594559,
+      "rel_l2_std": 0.09214835081627759,
+      "samples": 1275
+    }
+  ]
+}

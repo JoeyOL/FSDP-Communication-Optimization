@@ -1,0 +1,12 @@
+{
+  "step_count": 51,
+  "total_bytes_per_rank": 1628669343,
+  "bytes_per_step_per_rank": 31934693,
+  "by_hook": [
+    {
+      "name": "hybrid_thresholdv_1bit",
+      "bytes_this_step": 31934693,
+      "bytes_total": 1628669343
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "step_count": 51,
+  "total_bytes_per_rank": 16286619021,
+  "bytes_per_step_per_rank": 319345471,
+  "by_hook": [
+    {
+      "name": "hybrid_topk_int8_v2",
+      "bytes_this_step": 319345471,
+      "bytes_total": 16286619021
+    }
+  ]
+}

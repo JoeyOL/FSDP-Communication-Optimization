@@ -1,0 +1,12 @@
+{
+  "step_count": 51,
+  "total_bytes_per_rank": 18096247788,
+  "bytes_per_step_per_rank": 354828388,
+  "by_hook": [
+    {
+      "name": "int8",
+      "bytes_this_step": 354828388,
+      "bytes_total": 18096247788
+    }
+  ]
+}

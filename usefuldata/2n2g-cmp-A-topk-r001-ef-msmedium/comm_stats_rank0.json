@@ -1,0 +1,12 @@
+{
+  "step_count": 51,
+  "total_bytes_per_rank": 2171545524,
+  "bytes_per_step_per_rank": 42579324,
+  "by_hook": [
+    {
+      "name": "topk",
+      "bytes_this_step": 42579324,
+      "bytes_total": 2171545524
+    }
+  ]
+}
