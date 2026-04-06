@@ -17,6 +17,7 @@ from perf.comm_profiler import (
 )
 from perf.comm_stats import snapshot as comm_snapshot, total_bytes as comm_total_bytes, reset_step as comm_reset_step
 from perf.grad_error_stats import snapshot as grad_error_snapshot
+from perf.adaptive_ratio_stats import snapshot as adaptive_ratio_snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +235,21 @@ def train_epoch_with_monitoring(model, dataloader, optimizer, scheduler, epoch, 
                 )
         except Exception as e:
             logger.warning(f"[grad_error_stats] failed to write runtime grad error stats: {e}")
+
+        # 自适应压缩逐 step 稀疏率统计：仅 adaptive hook 生效，记录每次通信调用的稀疏率。
+        try:
+            adaptive_stats = adaptive_ratio_snapshot()
+            if adaptive_stats:
+                (log_dir / "adaptive_ratio_stats_rank0.json").write_text(
+                    json.dumps({"by_hook": adaptive_stats}, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                logger.info(
+                    "[adaptive_ratio_stats] wrote per-step adaptive sparsity stats to %s",
+                    log_dir / "adaptive_ratio_stats_rank0.json",
+                )
+        except Exception as e:
+            logger.warning(f"[adaptive_ratio_stats] failed to write runtime adaptive stats: {e}")
 
     return avg_loss
     
