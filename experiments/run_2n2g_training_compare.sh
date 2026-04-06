@@ -1,96 +1,4 @@
 #!/usr/bin/env bash
-set -euo pipefail
-
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT"
-
-if [[ -z "${MASTER_ADDR:-}" ]]; then
-  echo "请设置 MASTER_ADDR 为主节点 IP，例如: MASTER_ADDR=10.0.0.3 $0" >&2
-  exit 2
-fi
-
-NODE_RANK="${NODE_RANK:-0}"
-MAX_STEPS="${MAX_STEPS:-51}"
-MODEL_SIZE="${MODEL_SIZE:-medium}"
-EVAL_WIKI_PPL="${EVAL_WIKI_PPL:-0}"
-
-EF=(--comm_error_feedback --comm_ef_local)
-
-common=(
-  --data_path "${DATA_PATH:-datasets/wikipedia_en_500mb.json}"
-  --output_dir "${OUTPUT_DIR:-fsdp_output}"
-  --nnodes 2
-  --node_rank "$NODE_RANK"
-  --master_addr "$MASTER_ADDR"
-  --master_port "${MASTER_PORT:-29500}"
-  --nproc 1
-  --max_steps "$MAX_STEPS"
-  --model_size "$MODEL_SIZE"
-  --batch_size "${BATCH_SIZE:-8}"
-  --max_length "${MAX_LENGTH:-1024}"
-)
-
-if [[ "$EVAL_WIKI_PPL" == "1" ]]; then
-  common+=(--eval_wiki_ppl)
-else
-  common+=(--no_eval_wiki_ppl)
-fi
-
-RNPF="${RUN_NAME_PREFIX:-2n2g-cmp-s2}"
-
-run_exp() {
-  local run_id="$1"
-  shift
-  local run_name="${RNPF}-${run_id}"
-  echo "========== ${run_name} | NODE_RANK=${NODE_RANK} =========="
-  ./scripts/step2_profile.sh "${common[@]}" --run_name "$run_name" "$@"
-}
-
-ADPT_BASE=(
-  -- --comm-adaptive-total-steps "$MAX_STEPS"
-  --comm-adaptive-min-ratio 0.001
-  --comm-adaptive-max-ratio 0.1
-  --comm-adaptive-base-hook topk
-)
-
-run_exp B2-adaptive-base-topk-grad-steps"${MAX_STEPS}"-ms"${MODEL_SIZE}" --comm_hook adaptive "${EF[@]}" "${ADPT_BASE[@]}" \
-  --comm-adaptive-schedule grad_adaptive
-
-run_exp B3-topk-fixed-r005-ef-ms"${MODEL_SIZE}" --comm_hook topk --comm_topk_ratio 0.05 "${EF[@]}"
-run_exp B3-topk-fixed-r01-ef-ms"${MODEL_SIZE}" --comm_hook topk --comm_topk_ratio 0.1 "${EF[@]}"
-
-run_exp C-hybrid-topk-int8-v2-r001-no-ef-ms"${MODEL_SIZE}" --comm_hook hybrid_topk_int8_v2 --comm_topk_ratio 0.01 \
-  -- --no-comm-error-feedback
-
-for ratio in 0.001 0.005 0.01 0.05 0.1; do
-  case "$ratio" in
-    0.001) rid=r0001 ;;
-    0.005) rid=r0005 ;;
-    0.01) rid=r001 ;;
-    0.05) rid=r005 ;;
-    0.1) rid=r01 ;;
-    *) rid="${ratio//./p}" ;;
-  esac
-  run_exp "C-hybrid-topk-int8-v2-sens-${rid}-ef-ms${MODEL_SIZE}" --comm_hook hybrid_topk_int8_v2 --comm_topk_ratio "$ratio" "${EF[@]}"
-done
-
-for wf in 0.0 0.1 0.3; do
-  case "$wf" in
-    0.0) wfid=wf0 ;;
-    0.1) wfid=wf01 ;;
-    0.3) wfid=wf03 ;;
-    *) wfid="wf${wf//./p}" ;;
-  esac
-  run_exp "C-adaptive-warmupdecay-${wfid}-steps${MAX_STEPS}-ms${MODEL_SIZE}" --comm_hook adaptive "${EF[@]}" \
-    -- --comm-adaptive-schedule warmup_decay \
-      --comm-adaptive-total-steps "$MAX_STEPS" \
-      --comm-adaptive-warmup-fraction "$wf" \
-      --comm-adaptive-min-ratio 0.001 \
-      --comm-adaptive-max-ratio 0.1 \
-      --comm-adaptive-base-hook topk
-done
-
-echo "[done] NODE_RANK=${NODE_RANK} 指标采集对比实验结束。请查看 <output_dir>/logs/<run_name>/training_metrics.json"#!/usr/bin/env bash
 # 两机两卡：用于训练指标采集（step2_profile）版的压缩算法对比脚本。
 #
 # 与 run_2n2g_compression_compare.sh（step1）区别：
@@ -120,7 +28,7 @@ fi
 NODE_RANK="${NODE_RANK:-0}"
 MAX_STEPS="${MAX_STEPS:-51}"
 MODEL_SIZE="${MODEL_SIZE:-medium}"
-EVAL_WIKI_PPL="${EVAL_WIKI_PPL:-0}"
+EVAL_WIKI_PPL="${EVAL_WIKI_PPL:-1}"
 
 # 与 chapter5 / step1 对齐：误差反馈 + 本地 EF
 EF=(--comm_error_feedback --comm_ef_local)
