@@ -3,18 +3,39 @@
 \chapter{通信压缩方法的设计与实现}
 
 本章在第2章FSDP通信瓶颈分析的基础上，系统阐述在后向梯度通信压缩方面的研究工作，包括模块化通信压缩框架的设计、量化类压缩算法和稀疏化类压缩算法的实现原理与工程细节。
-
-
 表~\ref{tab:compress-overview}从核心思想、主要优点与局限三个方面对本章将要实现的8种典型通信压缩方法进行了总结，为后续各节的详细设计与实现提供全局视角。
 
-\begin{table}[htbp]
+{
+\wuhao
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.22}
+\begin{longtable}{
+	>{\centering\arraybackslash}p{0.10\textwidth}
+	>{\centering\arraybackslash}p{0.10\textwidth}
+	>{\raggedright\arraybackslash}p{0.24\textwidth}
+	>{\raggedright\arraybackslash}p{0.24\textwidth}
+	>{\raggedright\arraybackslash}p{0.24\textwidth}
+}
 \caption{典型通信压缩方法对比总结}
-\label{tab:compress-overview}
-\vspace{0.5em}\centering\wuhao
-\begin{tabularx}{\textwidth}{l l X X X}
+\label{tab:compress-overview}\\
 \toprule
 方法 & 类型 & 核心思想 & 主要优点 & 主要局限 \\
 \midrule
+\endfirsthead
+
+\caption[]{典型通信压缩方法对比总结（续表）}\\
+\toprule
+方法 & 类型 & 核心思想 & 主要优点 & 主要局限 \\
+\midrule
+\endhead
+
+\midrule
+\multicolumn{5}{r}{续下页}\\
+\endfoot
+
+\bottomrule
+\endlastfoot
+
 INT8量化 & 低比特量化 & 使用线性方式将32\,bit梯度量化到8\,bit表示 & 可获得约$4\times$通信压缩；实现简单，易于部署 & 对小梯度敏感；需要全局尺度 \\
 \addlinespace
 1-bit Seide & 1-bit符号量化 & 仅传输梯度符号（$\pm 1$），在每个块上维护正负两类分量的均值，配合误差反馈 & 压缩比可达$32\times$，显著降低通信负载；在保持1-bit通信的前提下降低重构误差 & 强有偏压缩，严重依赖误差反馈；残差张量显存开销较大 \\
@@ -30,43 +51,62 @@ Random-k & 稀疏化 & 随机选取$k$个坐标，通过放大系数保持无偏
 Threshold-v & 稀疏化 & 通过对称正负阈值丢弃小梯度，仅保留幅值大于阈值的分量 & 计算复杂度低于完整排序；在梯度分布稳定时可近似实现Top-k效果 & 性能高度依赖阈值选择；在不同层和训练早晚阶段需要调节阈值 \\
 \addlinespace
 Sketched-SGD & 草图+稀疏化 & 使用Count Sketch构建梯度sketch，合并后恢复近似Top-k梯度元素，仅对这些元素做精确通信 & 理论上将per-worker通信复杂度降到$O(k\log d)$，并给出与Top-k同阶的收敛率；在大模型上可实现$20\!\times$\textasciitilde$40\!\times$总通信压缩 & 实现复杂度较高；需要两轮通信和额外恢复计算；压缩收益对sketch尺寸与$k$的选择较敏感 \\
-\bottomrule
-\end{tabularx}
-\end{table}
+\end{longtable}
+}
+
+可以看到现有文献主要从两个方向对梯度通信进行压缩：（1）量化
+（quantization）：在不改变向量维度的前提下，使用更少的比特数表示每一
+个梯度分量，从而降低单位元素的通信代价；（2）稀疏化（sparsification）：
+仅传输部分“重要”的梯度分量及其取值，将其余分量在解码端视为零，从
+而直接减少参与通信的分量数量。前者侧重解决“每个元素太贵”的问题，
+后者则从“并非所有元素都值得传”的角度出发，两者在偏差、方差、实现
+复杂度和理论收敛性之间形成不同的权衡。本节将围绕上述两个方向开展，
+重点包括：基于 FSDP 通信钩子的模块化压缩框架，以及在该框架下已实现
+的量化与稀疏化算法族及其在训练过程中的作用机理。
 
 \section{模块化通信压缩框架}
 
-\subsection{框架设计动机}
+现有文献中的大多数通信压缩算法往往与特定的训练框架或实现环境深度耦合，
+例如假定参数服务器架构、单一All-Reduce通信模式，或依赖自定义的梯度聚合逻辑，
+因而难以在不做大幅改动的情况下直接迁移到PyTorch FSDP的分片梯度通信路径之中。
+为便于在统一平台上对比不同压缩方法，本文围绕FSDP的communication hook机制，
+设计并实现了一个模块化的通信压缩框架。该框架的核心思想是将"训练主逻辑"
+与"通信压缩策略"解耦，使得不同压缩算法可以在不修改训练循环与模型定
+义的前提下自由切换与组合。在实现层面，通信压缩框架包含以下相互配合的组成部分。
 
-现有文献中的大多数通信压缩算法往往与特定的训练框架或实现环境深度耦合，例如假定参数服务器架构、单一All-Reduce通信模式，或依赖自定义的梯度聚合逻辑，因而难以在不做大幅改动的情况下直接迁移到PyTorch FSDP的分片梯度通信路径之中。为便于在统一平台上对比不同压缩方法，本文围绕FSDP的communication hook机制，设计并实现了一个模块化的通信压缩框架。
-
-\subsection{框架架构}
-
-该框架的核心思想是将"训练主逻辑"与"通信压缩策略"解耦，使得不同压缩算法可以在不修改训练循环与模型定义的前提下自由切换与组合。在实现层面，通信压缩框架包含以下相互配合的组成部分。
-
-在FSDP中，每个通信钩子均遵循统一的抽象接口：
+首先，在FSDP中，每个通信钩子均遵循统一的抽象接口：
 \begin{equation}
 \text{hook}: (\text{state}, \mathbf{g}_{\text{full}}, \mathbf{g}_{\text{shard}}) \mapsto \text{None},
 \label{eq:hook-interface}
 \end{equation}
-其中$\text{state}$为特定算法的状态对象，$\mathbf{g}_{\text{full}} \in \mathbb{R}^{n}$为当前FSDP单元的完整扁平梯度，$\mathbf{g}_{\text{shard}} \in \mathbb{R}^{n/W}$为当前rank上待写入的梯度分片缓冲区（$W$为world size）。Hook内部负责完成"压缩$\to$通信$\to$解码$\to$写回分片"的全过程。
+其中$\text{state}$为特定算法的状态对象，$\mathbf{g}_{\text{full}} \in \mathbb{R}^{n}$
+为当前FSDP单元的完整扁平梯度，$\mathbf{g}_{\text{shard}} \in \mathbb{R}^{n/W}$为当前
+rank上待写入的梯度分片缓冲区（$W$为world size）。Hook内部负
+责完成"压缩$\to$通信$\to$解码$\to$写回分片"的全过程。
 
-各压缩算法通过各自的状态类（如GradQuantState、TopKState、SketchState等）维护必要的超参数和运行时统计量，包括量化级数、稀疏率、误差反馈残差张量以及是否启用误差反馈等。
-
-\subsection{误差反馈机制}
-
-误差反馈（Error Feedback）是保证有偏压缩算法收敛性的关键机制。在统一的残差更新公式下，误差反馈的实现如下：
+其次，各压缩算法通过各自的状态类
+（如GradQuantState、TopKState、SketchState等）
+维护必要的超参数和运行时统计量，
+包括量化级数、稀疏率、误差反馈残差张量以及是否启用误差反馈等。
+误差反馈（Error Feedback）是保证有偏压缩算法收敛性的关键机制。
+式\ref{eq:error-feedback}为本文各方法统一的残差更新公式。
 \begin{equation}
 \tilde{\mathbf{g}}_t = \mathbf{g}_t + \mathbf{e}_t, \quad \mathbf{c}_t = C(\tilde{\mathbf{g}}_t), \quad \mathbf{e}_{t+1} = \tilde{\mathbf{g}}_t - D(\mathbf{c}_t),
 \label{eq:error-feedback}
 \end{equation}
-其中$C(\cdot)$与$D(\cdot)$分别为压缩与解压算子，$\mathbf{e}_t$为上一轮残差。残差既可以按完整梯度维度维护，也可以仅按本rank分片维度维护以减少附加显存开销。
+其中$C(\cdot)$与$D(\cdot)$分别为压缩与解压算子，
+$\mathbf{e}_t$为上一轮残差。残差仅按本rank分片维度维护以减少附加显存开销。
 
-框架通过集中式构建函数\texttt{build\_comm\_hook(name, ...)}完成压缩算法的注册与选择，将不同算法名称映射到各自的状态类与hook函数对。训练入口脚本通过命令行参数\texttt{--comm-hook}选择具体方法，再调用\texttt{model.register\_comm\_hook(state, hook)}完成注册。
+最后，框架通过集中式构建函数 build\_comm\_hook(name, ...) 完成
+压缩算法的注册与选择，将不同算法名称映射到各自的状态类与 hook 函数对。
+训练入口脚本通过命令行参数 --comm-hook 选择具体方法，
+再调用 model.register\_comm\_hook(state, hook) 完成注册。
 
 \section{量化类压缩算法}
 
-量化类方法在不改变梯度维度的前提下，通过减少每个梯度分量的表示比特数来压缩通信量。本文实现的量化方法主要包括INT8对称量化、QSGD随机量化、Natural Compression以及1-bit Seide等方案。
+量化类方法在不改变梯度维度的前提下，通过减少每个梯度分量的表示比特数
+来压缩通信量。本文实现的量化方法主要包括INT8对称量化、QSGD随机量化、
+Natural Compression（NC）以及1-bit Seide等方案。
 
 \subsection{INT8对称量化}
 
@@ -81,20 +121,35 @@ s = \frac{q_{\max}}{\max|\mathbf{g}| + \epsilon},
 \label{eq:int8-quantdequant}
 \end{equation}
 
-在FSDP集成中，各rank在本地计算缩放因子并通过一次\texttt{all\_reduce(max)}获得全局一致的缩放因子后，将扁平梯度量化为int8张量，经\texttt{reduce\_scatter(sum)}聚合，再按缩放因子与world size反缩放得到平均梯度分片。该方法实现简单，可获得约4倍通信压缩比。
+在FSDP集成中，各rank在本地计算缩放因子并通过一次 All\_Reduce(max) 
+获得全局一致的缩放因子后，
+将扁平梯度量化为int8张量，经 Reduce\_Scatter(sum) 聚合，再按缩
+放因子与world size反缩放得到平均梯度分片。该方法实现简单，可获得
+约4倍通信压缩比。
 
 \subsection{QSGD随机量化}
 
-QSGD\cite{alistarh2017qsgd}将每个梯度分量随机舍入到有限个离散级，在期望意义下保持无偏。对非零梯度向量$\mathbf{g}$，选取级数$s$，有：
+QSGD\cite{alistarh2017qsgd}将每个梯度分量随机舍入到有限个离散级，
+在期望意义下保持无偏。对非零梯度向量$\mathbf{g}$，选取级数$s$，有：
 \begin{equation}
 Q_{\text{QSGD}}(\mathbf{g}_i) = \|\mathbf{g}\|_2 \cdot \text{sign}(\mathbf{g}_i) \cdot \xi(|\mathbf{g}_i|, s),
 \label{eq:qsgd}
 \end{equation}
-其中$\xi(|\mathbf{g}_i|, s) \in \{0, 1/s, \ldots, 1\}$的分布由$|\mathbf{g}_i|/\|\mathbf{g}\|_2$所在的量化区间决定，保证$\mathbb{E}[Q_{\text{QSGD}}(\mathbf{g}_i)] = \mathbf{g}_i$，并对量化方差给出上界。本实现将当前FSDP单元的完整扁平梯度$\mathbf{g}$视为一个整体，只计算一次全向量$\ell_2$范数$\|\mathbf{g}\|_2$，并对每个坐标应用上述随机量化算子。通信层面，把量化结果编码为紧凑的bit串，经\texttt{all\_to\_all}交换后在本地解码。
 
-\subsection{Natural Compression}
+其中$\xi(|\mathbf{g}_i|, s) \in \{0, 1/s, \ldots, 1\}$
+的分布由$|\mathbf{g}_i|/\|\mathbf{g}\|_2$所在的量化区间决定，
+保证$\mathbb{E}[Q_{\text{QSGD}}(\mathbf{g}_i)] = \mathbf{g}_i$，
+并对量化方差给出上界。本实现将当前FSDP单元的完整扁平梯度$\mathbf{g}$视为
+一个整体，只计算一次全向量$\ell_2$范数$\|\mathbf{g}\|_2$，并对每个
+梯度元素应用上述随机量化算子随机舍入到$s$个离散级之一，最后将量化结果缩放为
+原尺度。通信层面，把量化结果编码为紧凑的bit串，经 All\_to\_All 交换后在本地解码。
 
-Natural Compression（NC）\cite{horvath2022nc}采用与浮点指数结构天然契合的非均匀码本，将每个标量随机舍入到邻近的两个二次幂之一。对$\mathbf{g}_i \ne 0$，记$l = \log_2 |\mathbf{g}_i|$，则：
+\subsection{Natural Compression量化}
+
+Natural Compression（NC）\cite{horvath2022nc}采用与
+浮点指数结构天然契合的非均匀码本，将每个标量随机舍入到邻
+近的两个二次幂之一。对$\mathbf{g}_i \ne 0$，
+记$l = \log_2 |\mathbf{g}_i|$，则：
 \begin{equation}
 Q_{\text{nat}}(\mathbf{g}_i) = \begin{cases}
 \text{sign}(\mathbf{g}_i) \cdot 2^{\lfloor l \rfloor}, & \text{以概率~} p(l), \\
@@ -102,13 +157,33 @@ Q_{\text{nat}}(\mathbf{g}_i) = \begin{cases}
 \end{cases}
 \label{eq:nc}
 \end{equation}
-其中$p(l)$的构造保证压缩算子无偏且二阶矩增幅受控。NC本身不依赖额外的全局缩放标量，适合多机多卡环境下的去中心化实现。量化结果打包为9比特编码（1比特符号$+$8比特指数），通过\texttt{all\_to\_all}交换后解码并求和。
 
-此外，为进一步减轻NC在低比特情形下对收敛性的影响，本文引入范数缩放机制：在量化前首先对全局梯度向量计算$\|\mathbf{g}\|_2$，再在各rank之间通过一次\texttt{all\_reduce(sum)}汇总得到全局范数$\|\mathbf{g}\|_{2,\text{global}}$，随后使用缩放因子$\text{scale} = 1/\max(\|\mathbf{g}\|_{2,\text{global}}, \epsilon)$将梯度归一化到单位球上，在归一化梯度上应用$Q_{\text{nat}}$。解码阶段完成聚合后除以scale恢复原始尺度。
+其中$p(l)$的构造保证压缩算子无偏且二阶矩增幅受控。
+NC本身不依赖额外的全局缩放标量，适合多机多卡环境下的去中心化实现。
+量化结果打包为9比特编码（1比特符号$+$8比特指数），通过 All\_to\_All 
+交换后解码并求和。
+
+此外，为进一步减轻NC在低比特情形下对收敛性的影响，
+本文引入范数缩放机制：在量化前首先对全局梯度向量计算
+$\|\mathbf{g}\|_2$，再在各rank之间通过一次 All\_Reduce(Sum) 
+汇总得到全局范数$\|\mathbf{g}\|_{2,\text{global}}$，
+随后使用缩放因子$\text{scale} = 1/\max(\|\mathbf{g}\|_{2,\text{global}}, \epsilon)$
+将梯度归一化到单位球上，在归一化梯度上
+应用$Q_{\text{nat}}$。解码阶段完成聚合后除以scale恢复原始尺度。
+范数缩放将量化过程限制在一个统一的归一化空间中，避免
+不同 batch 或不同层之间梯度范数差异过大导致的小分量系统性被舍入为
+零，从而在保持通信量优势的同时，降低了 NC 对损失曲线和收敛速度的不
+利影响。
 
 \subsection{1-bit Seide量化}
 
-1-bit量化将每个梯度元素压缩为单个符号位$\hat{\mathbf{g}}_i = \text{sign}(\mathbf{g}_i)$，并配合标量缩放参数恢复近似梯度。Seide形式\cite{seide2014onebit}进一步在每个块上维护正负两类分量的均值$\mu^+, \mu^-$，通信阶段仅发送符号与$(\mu^+, \mu^-)$，解码时根据符号从二者中选择重构值：
+1-bit量化将每个梯度元素压缩为单个符
+号位$\mathbf{q}_i = \text{sign}(\mathbf{g}_i)$，
+并配合标量缩放参数恢复近似梯度$\hat{\mathbf{g}_i = \mu\mathbf{q}_i}$。
+其中 $\mu$ 可取为$ℓ_1$范数均值或
+分桶局部均值。Seide形式\cite{seide2014onebit}
+进一步在每个块上维护正负两类分量的均值$\mu^+, \mu^-$，通
+信阶段仅发送符号与$(\mu^+, \mu^-)$，解码时根据符号从二者中选择重构值：
 \begin{equation}
 \tilde{\mathbf{g}}_i = \begin{cases}
 \mu^+, & \text{if~} \hat{\mathbf{g}}_i = +1, \\
@@ -116,15 +191,21 @@ Q_{\text{nat}}(\mathbf{g}_i) = \begin{cases}
 \end{cases}
 \label{eq:onebit-seide}
 \end{equation}
-在保持1-bit通信的前提下降低重构误差。由于此类方法本质上为强有偏压缩，误差反馈几乎是必需组件。该方法可实现高达32倍的压缩比。
+在保持1-bit通信的前提下降低重构误差。由于此类方法本质上为强有偏压缩，
+误差反馈几乎是必需组件。该方法可实现高达32倍的压缩比。
 
 \section{稀疏化类压缩算法}
 
-稀疏化类方法通过减少参与通信的梯度元素数量来压缩通信量，仅对被选中的梯度元素发送索引及其取值，其余坐标在解码端视为零。
+稀疏化类方法通过减少参与通信的梯度元素数量来压缩通信量，
+仅对被选中的梯度元素发送索引及其取值，其余坐标在解码端视为零。
+本课题实现的稀疏化方法主要包 括 Top-k 、 Random-k 、 Threshold-v 以 及
+Sketched-SGD 等。
 
 \subsection{Top-k稀疏化}
 
-Top-k稀疏化方法保留梯度向量中绝对值最大的$k$个坐标，其余置零\cite{stich2018sparsified}：
+Top-k稀疏化方法保留梯度向量中绝对值最大的$k$个坐标，
+其余置零\cite{stich2018sparsified}：记$\left\|\mathbf{g}_1\right\|\geq \ldots \geq \left\|\mathbf{g}_n\right\|$，
+为$\mathbf{g}$的绝对值排序后的非增序列，则：
 \begin{equation}
 \text{Top}_k(\mathbf{g})_i = \begin{cases}
 \mathbf{g}_i, & i \text{~属于前~} k \text{~大坐标}, \\
@@ -132,11 +213,16 @@ Top-k稀疏化方法保留梯度向量中绝对值最大的$k$个坐标，其余
 \end{cases}
 \label{eq:topk}
 \end{equation}
-实现时通常令$k = \lfloor \rho \cdot n \rfloor$，其中$\rho$为目标稀疏率。Top-k为有偏压缩，需配合误差反馈以保证长期收敛性。在梯度通信中，Top-k仅发送选中坐标的索引与取值，经\texttt{all\_gather}后在本地合并，在$\rho \ll 1$时可显著降低通信字节数。
+实现时通常令$k = \lfloor \rho \cdot n \rfloor$，
+其中$\rho$为目标稀疏率。Top-k为有偏压缩，需配合误差反馈以保
+证长期收敛性。在梯度通信中，Top-k仅发送选中坐标的索引与取值，
+经 All\_Gather 后在本地合并，在$\rho \ll 1$时可显著降低通信字节数。
 
 \subsection{Random-k随机稀疏化}
 
-与Top-k相比，Random-k更强调无偏性。Random-k从$\{1, \ldots, n\}$中均匀随机选取$k$个分量并保留其取值，为保持无偏性对被选中分量乘以缩放因子$n/k$：
+与Top-k相比，Random-k更强调无偏性。Random-k从$\{1, \ldots, n\}$
+中均匀随机选取$k$个分量并保留其取值，为保持无偏性对被选中分量乘以
+缩放因子$n/k$：
 \begin{equation}
 \text{Rand}_k(\mathbf{g})_i = \begin{cases}
 (n/k) \cdot \mathbf{g}_i, & i \in \mathcal{S}, \\
@@ -144,11 +230,16 @@ Top-k稀疏化方法保留梯度向量中绝对值最大的$k$个坐标，其余
 \end{cases}
 \label{eq:randomk}
 \end{equation}
-其中$\mathcal{S}$为均匀随机选取的$k$个坐标集合。Random-k的计算复杂度较低，易于并行实现，无偏性保证理论收敛，但方差与压缩率直接相关。
+
+其中$\mathcal{S}$为均匀随机选取的$k$个坐标集合。
+Random-k的计算复杂度较低，易于并行实现，无偏性保证理论收敛，
+但方差与压缩率直接相关。
 
 \subsection{Threshold-v阈值稀疏化}
 
-Threshold-v方法通过双阈值控制稀疏化程度\cite{dutta2020threshold}。使用正、负两个阈值$v^+ \ge 0$、$v^- \ge 0$，仅保留满足$\mathbf{g}_i \ge v^+$或$\mathbf{g}_i \le -v^-$的分量：
+Threshold-v方法通过双阈值控制稀疏化程度\cite{dutta2020threshold}。
+该方法使用正、负两个阈值$v^+ \ge 0$、$v^- \ge 0$，
+仅保留满足$\mathbf{g}_i \ge v^+$或$\mathbf{g}_i \le -v^-$的梯度元素：
 \begin{equation}
 \text{Thresh}(\mathbf{g})_i = \begin{cases}
 \mathbf{g}_i, & \mathbf{g}_i \ge v^+ \text{~或~} \mathbf{g}_i \le -v^-, \\
@@ -156,19 +247,31 @@ Threshold-v方法通过双阈值控制稀疏化程度\cite{dutta2020threshold}�
 \end{cases}
 \label{eq:thresholdv}
 \end{equation}
-阈值可由用户显式给定，也可根据目标稀疏率从当前梯度的经验分位数自适应估计。与Top-k相比，Threshold-v避免了完整排序，计算复杂度更低。
+阈值可由用户显式给定，也可根据目标稀疏率从当前梯度的经验分位数自适应估计。
+在本文实现中，当未指定显式阈值时，系统会根据目标稀疏率近似选取对应分位数作为对称阈值。
+与Top-k相比，Threshold-v避免了完整排序，计算复杂度更低，但对阈值的选择更为敏感。
 
 \subsection{Sketched-SGD}
 
-Sketched-SGD\cite{ivkin2019communication}代表了基于sketch的整体稀疏化思想。该方法通过将梯度映射到Count Sketch数据结构中来压缩维度，并利用sketch的线性性在通信侧合并各worker的sketch，再从合并后的sketch中恢复近似top-k坐标。
+Sketched-SGD\cite{ivkin2019communication}代表了
+基于sketch的整体稀疏化思想。该方法通过将梯度映射到Count Sketch数据
+结构中来压缩维度，并利用sketch的线性性在通信侧合并各worker的sketch，
+再从合并后的sketch中恢复近似top-k坐标。
 
-设Count Sketch由深度$d_s$、宽度$w_s$以及两组哈希函数$h_j: [n] \to [w_s]$、符号函数$s_j: [n] \to \{-1, 1\}$（$j = 1, \ldots, d_s$）定义，则第$j$行的sketch向量为：
+具体而言，设Count Sketch由深度$d_s$、宽度$w_s$
+以及两组哈希函数$h_j: [n] \to [w_s]$、
+符号函数$s_j: [n] \to \{-1, 1\}$（$j = 1, \ldots, d_s$）定义，
+则第$j$行的sketch向量为：
 \begin{equation}
 S_j(\mathbf{g})[\ell] = \sum_{i: h_j(i) = \ell} s_j(i) \cdot \mathbf{g}_i, \quad \ell = 1, \ldots, w_s.
 \label{eq:sketch}
 \end{equation}
 
-利用Count Sketch的线性性，有$S(\mathbf{g}^{(1)} + \mathbf{g}^{(2)}) = S(\mathbf{g}^{(1)}) + S(\mathbf{g}^{(2)})$，因此多worker情况下可以先对各自的sketch做\texttt{all\_reduce(sum)}，再在合并后的全局sketch上恢复近似top-k坐标。典型流程包括：各rank对本地梯度计算sketch表示，通过\texttt{all\_reduce}求和得到全局sketch，在全局sketch上应用HEAVYMIX策略得到重度坐标集合，最后对这些坐标执行第二轮精确值通信。理论上可将per-worker通信复杂度降到$O(k \log n)$。
+利用Count Sketch的线性性，有$S(\mathbf{g}^{(1)} + \mathbf{g}^{(2)}) = S(\mathbf{g}^{(1)}) + S(\mathbf{g}^{(2)})$，因此多worker情况下可以先对各自的sketch做\texttt{all\_reduce(sum)}，再在合并后的全局sketch上恢复近似top-k坐标。
+
+HEAVYMIX策略在全局sketch上给出每个坐标的平方幅值估计$\widehat{g_i^2}$及总能量估计$\widehat{L_2^2} \approx \|\mathbf{g}\|_2^2$，并据此构造重度坐标集合$H = \{i : \widehat{g_i^2} \ge \widehat{L_2^2} / k\}$，若$|H| < k$则再从其余分量索引中随机补足到$k$个。典型流程包括：各rank对本地梯度计算Count Sketch得到低维sketch表示；通过all-reduce对sketch求和得到全局sketch；在全局sketch上应用HEAVYMIX得到集合$H$；最后对集合$H$中对应的梯度分量执行第二轮精确值通信（如all-gather），得到这些分量上的精确梯度总和。与逐分量稀疏化方法相比，Sketched-SGD在高维场景下具备更优的理论通信复杂度，但在实际实现中需要平衡sketch尺寸、恢复精度与额外的计算开销。
+
+理论上可将per-worker通信复杂度降到$O(k \log n)$。
 
 \section{本章小结}
 
