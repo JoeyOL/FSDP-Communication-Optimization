@@ -59,24 +59,28 @@ Step1: 一键启动耗时取证（torch.profiler + step wall time + overlap）
 
 示例：
   # 单机 1 卡
-  ./scripts/step1_profile.sh --data_path datasets/wikipedia_en_300mb.json --nproc 1
+  ./scripts/step1_profile.sh --data_path datasets/wikipedia_en_10mb.json --nproc 1
 
   # 单机 2 卡
   ./scripts/step1_profile.sh --data_path datasets/wikipedia_en_300mb.json --nproc 2 --max_steps 50
 
   # 两机两卡（两机各 1 卡，总 2 卡）
   # 机器0（node_rank=0，同时也是 master）：
-  ./scripts/step1_profile.sh --data_path datasets/wikipedia_en_300mb.json     --nnodes 2 --node_rank 0 --master_addr 10.0.0.1 --master_port 29500     --nproc 1 --max_steps 50 --run_name step1-2node-2gpu
+  ./scripts/step1_profile.sh --data_path datasets/wikipedia_en_500mb.json \
+    --nnodes 2 --node_rank 0 --master_addr 10.0.0.3 --master_port 29500 \
+    --nproc 1 --max_steps 50
 
   # 机器1（node_rank=1）：
-  ./scripts/step1_profile.sh --data_path datasets/wikipedia_en_300mb.json     --nnodes 2 --node_rank 1 --master_addr 10.0.0.1 --master_port 29500     --nproc 1 --max_steps 50 --run_name step1-2node-2gpu
+  ./scripts/step1_profile.sh --data_path datasets/wikipedia_en_500mb.json \
+    --nnodes 2 --node_rank 1 --master_addr 10.0.0.3 --master_port 29500 \
+    --nproc 1 --max_steps 50
 
   # 注意：离线统计（summary/csv）只在 node_rank=0 上生成。
 EOF
 }
 
 DATA_PATH="datasets/wikipedia_en_500mb.json"
-OUTPUT_DIR="/root/llama-7b/fsdp_output"
+OUTPUT_DIR="fsdp_output"
 RUN_NAME=""
 NPROC=2
 NNODES=1
@@ -86,7 +90,7 @@ MASTER_PORT=29500
 MAX_STEPS=52
 DATASET_MAX_SAMPLES=0
 BATCH_SIZE=8
-MAX_LENGTH=1024
+MAX_LENGTH=512
 GRADIENT_ACCUMULATION_STEPS=1
 MODEL_SIZE="medium"
 COMM_HOOK="none"              # 通信压缩算法名称（none/int8/qsgd/onebit_seide/...）

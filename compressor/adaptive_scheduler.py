@@ -34,6 +34,7 @@ from .common import (
     logger,
 )
 from perf.comm_stats import add_bytes as _comm_add_bytes
+from perf.adaptive_ratio_stats import add_sample as _adaptive_add_sample
 
 
 # ── Log cap ──────────────────────────────────────────────────────────────────
@@ -266,7 +267,13 @@ def fsdp_adaptive_comm_hook(
             g[start:end] += residual
 
     # ── Compute gradient norm (for grad_adaptive) ──
-    grad_norm = float(g.norm().item())
+    # Use a synchronized global norm proxy so all ranks derive identical ratio/k.
+    grad_norm_local = float(g.norm().item())
+    grad_norm = grad_norm_local
+    if world_size > 1:
+        gn = torch.tensor([grad_norm_local], device=g.device, dtype=torch.float32)
+        dist.all_reduce(gn, op=dist.ReduceOp.SUM, group=pg)
+        grad_norm = float((gn / float(world_size)).item())
 
     # ── Determine current ratio ──
     if state.schedule == "warmup_decay":
@@ -291,12 +298,32 @@ def fsdp_adaptive_comm_hook(
     current_ratio = max(state.min_ratio, min(state.max_ratio, current_ratio))
     k = max(1, int(numel * current_ratio))
     k = min(k, numel)
+    if world_size > 1:
+        k_tensor = torch.tensor([k], device=g.device, dtype=torch.int64)
+        dist.broadcast(k_tensor, src=0, group=pg)
+        k = int(k_tensor.item())
+        # Keep a consistent derived ratio for logging/recording after k sync.
+        current_ratio = float(k) / float(numel)
+
+    try:
+        _adaptive_add_sample(
+            state=state,
+            comm_step=state._step,
+            schedule=state.schedule,
+            ratio_keep=current_ratio,
+            k=k,
+            numel=numel,
+            grad_norm=grad_norm,
+            ema_norm=state._grad_norm_ema,
+        )
+    except Exception:
+        pass
 
     if do_log:
         logger.info(
-            "[adaptive] step=%d/%d schedule=%s ratio=%.6f k=%d/%d base=%s grad_norm=%.4f",
+            "[adaptive] step=%d/%d schedule=%s ratio=%.6f k=%d/%d base=%s grad_norm(local=%.4f,global=%.4f)",
             state._step, state.total_steps, state.schedule,
-            current_ratio, k, numel, state.base_hook_name, grad_norm,
+            current_ratio, k, numel, state.base_hook_name, grad_norm_local, grad_norm,
         )
 
     # ── Stage-1: Sparsification ──

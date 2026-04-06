@@ -187,7 +187,7 @@ def _parse_args() -> argparse.Namespace:
         default="datasets/wikipedia_en_500mb.json",
         help="Path to wikipedia json array file.",
     )
-    p.add_argument("--max_length", type=int, default=512)
+    p.add_argument("--max_length", type=int, default=1024)
     p.add_argument("--shard_size", type=int, default=2000)
     p.add_argument(
         "--cache_dir",

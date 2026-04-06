@@ -26,11 +26,6 @@ $BASE
 $BASE --comm_hook int8 --comm_int8_variant linear
 ```
 
-### INT8 Dynamic Tree 量化（dynamic_tree）
-
-```bash
-$BASE --comm_hook int8 --comm_int8_variant dynamic_tree
-```
 
 ### 1-bit Seide
 
@@ -43,11 +38,6 @@ export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6:$LD_PRELOAD
 $BASE --comm_hook onebit_seide --comm_onebit_col_size 256 --comm_error_feedback
 ```
 
-如需关闭误差反馈（不推荐）：
-
-```bash
-$BASE --comm_hook onebit_seide --comm_onebit_col_size 256
-```
 
 ### Natural Compression（±2^k 舍入，可选 9 比特打包）
 
@@ -59,21 +49,11 @@ $BASE --comm_hook nc --comm_error_feedback
 
 关闭 9 比特打包、改用 `reduce_scatter(float32)`（通信量同 baseline）：
 
-```bash
-$BASE --comm_hook nc --no_comm_nc_bit_packing
-```
 
 **NC loss 偏大时**：默认已开启 **范数缩放**（先除以 \|\|g\|\|_2 再量化，解码后乘回），小梯度不易被舍入为 0，可明显改善 loss。若需关闭：`$BASE --comm_hook nc --no-comm-nc-norm-scale`（一般不推荐）。
 
 ### QSGD（均匀量化，支持分桶）
 
-**论文里为何能省通信（Alistarh et al., NIPS 2017）**：  
-QSGD 在论文里是「量化 + 编码」两步：量化后不传 float，而是把量化结果编码成比特串（范数 + 级别/符号的打包或 Elias 编码），使每轮通信从 32n 比特降到约 2.8n+32 等，实现约 5.7× 带宽节省。
-
-**本实现**：  
-- **low_bit_comm=True（默认）**：对量化后的梯度按桶编码为 bit 串（每桶保存 4 字节范数 + 紧凑的 sign/level），各 rank 之间通过 **all_to_all** 交换编码后的各个 shard，在本地一次性解码并求和得到本 rank 的梯度分片，再除以 $M$。这是更贴近原论文的“位级通信”路径，能在带宽占主导时进一步降低通信比特数，但需要 all_to_all 支持。  
-- **low_bit_comm=False**（`--no-comm-qsgd-low-bit`）：不做 bit 编码，仅在浮点域中以 **reduce_scatter(float16)** 传输量化结果，在保持与 baseline 相同 collective 的前提下将通信字节数压缩为 float32 的一半。  
-建议整向量/按桶均可加 `--comm_error_feedback` 以减轻量化噪声。
 
 整向量 QSGD（s=4）+ 误差反馈（推荐）：
 
@@ -81,17 +61,6 @@ QSGD 在论文里是「量化 + 编码」两步：量化后不传 float，而是
 $BASE --comm_hook qsgd --comm_qsgd_s 4 --comm_qsgd_bucket_size 0 --comm_error_feedback
 ```
 
-默认使用 **all_to_all + bit 编码** 的低比特路径；若希望仅在浮点域减半通信量且沿用 baseline 的 reduce_scatter 语义，可关闭低比特模式：
-
-```bash
-$BASE --comm_hook qsgd --comm_qsgd_s 4 --comm_qsgd_bucket_size 0 --no-comm-qsgd-low-bit
-```
-
-整向量 QSGD（s=4，无误差反馈，易劣于 baseline）：
-
-```bash
-$BASE --comm_hook qsgd --comm_qsgd_s 4 --comm_qsgd_bucket_size 0
-```
 
 按桶 QSGD（例如每 512 元素一桶）：
 
@@ -99,24 +68,6 @@ $BASE --comm_hook qsgd --comm_qsgd_s 4 --comm_qsgd_bucket_size 0
 $BASE --comm_hook qsgd --comm_qsgd_s 4 --comm_qsgd_bucket_size 512 --comm_error_feedback
 ```
 
-**为何 QSGD 有时不能缩短通信时间（基于 step1-20260221-123618 vs step1-20260221-135840）**  
-- **baseline（comm_hook=none）**：AllGather 2450 次、约 9.49s，ReduceScatter(f32) 1250 次、约 5.76s，**总通信约 15.24s**。  
-- **QSGD（bucket_size=512 + error_feedback）**：ReduceScatter 改为 **f16**，1250 次约 **2.65s**（约减半，符合数据量减半）；但 AllGather 变为 **3700 次、约 14.30s**。  
-- **原因**：误差反馈在每次 hook 后要 **all_gather** 完整 shard 以更新 residual（`_apply_error_feedback` → `_all_gather_shard`），所以 AllGather 次数与时间显著增加，**总通信约 16.97s**，比 baseline 略差。  
-- **结论**：在单机 2 卡、当前实现下，**error_feedback 引入的 AllGather 开销抵消了 ReduceScatter 减半的收益**；若更关注通信时间，可尝试关闭 error_feedback，或使用**本地误差反馈**（见下）。
-
-**误差反馈优化：本地 EF（`--comm-ef-local`）**  
-- 标准 EF：每参数在通信后用 **all_gather** 拼回完整梯度以更新 residual，导致 AllGather 次数与时间增加。  
-- **本地 EF**：仅对本 rank 的 **shard** 做残差更新（residual = 本 shard 的 to_compress - shard_out），**不做 all_gather**，通信量与无 EF 时一致，仅多一次本地减法。  
-- 使用方式：在开启 `--comm_error_feedback` 时同时加 `--comm_ef_local`，例如：  
-  `$BASE --comm_hook qsgd --comm_error_feedback --comm_ef_local` 或  
-  `$BASE --comm_hook nc --comm_error_feedback --comm_ef_local`。  
-- 注意：本地 EF 的残差只作用于本 rank 的 shard，与论文里「全量 residual」略有差异，通常仍能明显减轻量化/稀疏噪声，且不增加通信时间。
-
-**开/关 EF 平均损失差不多？**  
-- **本地 EF（默认）**：只对本 shard 做残差，对 loss 的改善通常弱于全量 EF；在步数少、压缩较轻（如 NC 9-bit）或 batch 较小时，有无 EF 的 loss 差异可能不明显。  
-- 若想确认「EF 本身有没有用」：用**全量 EF** 跑同样配置（`--comm_error_feedback --no_comm_ef_local`），看 loss 是否比无 EF 或本地 EF 更稳/更低；全量 EF 更贴近论文，但会多一次 AllGather。  
-- 若更在意通信时间：保持默认本地 EF 即可；若更在意收敛/loss：可尝试全量 EF（牺牲一点通信）。
 
 ### Top-k 稀疏
 
@@ -138,11 +89,6 @@ $BASE --comm_hook randomk --comm_topk_ratio 0.01
 $BASE --comm_hook threshold_v --comm_topk_ratio 0.01 --comm_threshold_v 0
 ```
 
-显式双阈值（正负不对称）：
-
-```bash
-$BASE --comm_hook threshold_v --comm_threshold_v 0.05 --comm_threshold_v_neg -0.02
-```
 
 ### Sketched-SGD（Count Sketch + HEAVYMIX）
 

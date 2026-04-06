@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 
 from perf.comm_stats import attach_to_state
+from perf.adaptive_ratio_stats import attach_to_state as attach_adaptive_ratio_to_state
 from perf.grad_error_stats import attach_to_state as attach_grad_error_to_state
 from perf.grad_error_stats import add_sample as _grad_add_sample
 
@@ -290,6 +291,7 @@ def build_comm_hook(
             ),
         )
         attach_to_state(state, n)
+        attach_adaptive_ratio_to_state(state, n)
         attach_grad_error_to_state(state, n)
         return state, _wrap_with_grad_error_stats(fsdp_adaptive_comm_hook)
 
