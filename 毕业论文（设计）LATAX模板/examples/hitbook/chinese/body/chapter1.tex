@@ -5,15 +5,15 @@
 \section{课题背景}
 
 近年来，随着深度学习技术的不断突破，以ChatGPT\cite{brown2020language}和
-BERT\cite{devlin2019bert}为代表的大语言模型（Large Language Model, LLM）为自然语言处理、
-生物医学、智能法律、教育辅助等领域带来了革命性的应用潜力。研究表明，LLMs的性能提升与其参数规模呈现强
-相关性：GPT-3使用1750亿参数在零样本和少样本任务中表现出超越前代模型的能力\cite{brown2020language}，
-而GPT-4通过万亿级参数进一步实现了复杂推理与多模态理解\cite{deng2009imagenet}。
+BERT\cite{devlin2019bert}为代表的大语言模型（Large Language Model, LLM）在自然语言处理、
+生物医学、智能法律、教育辅助等领域展现出了很大的应用前景。研究表明，LLMs的性能与参数规模之间
+存在较强的正相关关系：GPT-3使用1750亿参数在零样本和少样本任务中表现出了超越前代模型的能力\cite{brown2020language}，
+而GPT-4通过万亿级参数进一步提升了复杂推理与多模态理解能力\cite{deng2009imagenet}。
 
-在深度学习模型规模呈指数级增长的时代背景下，LLM的训练过程正面临严峻的挑战。单机训练超大规模模型
+随着模型规模不断增长，LLM的训练过程面临着严峻的挑战。单机训练超大规模模型
 几乎不可能，因为模型参数和中间激活值的内存需求远远超过了单个GPU的内存容量。以GPT-4模型为例，其
 千亿级别的模型参数需要数百GB的存储空间，再加上训练过程中的梯度、优化器状态和中间激活值，总内存
-需求已达到TB级别。单机显存的不足促使了分布式训练的出现，目前分布式训练已成为LLMs训练的必
+需求已达到TB级别。因此，分布式训练已成为LLMs训练的必
 要手段\cite{li2014scaling,gibiansky2017allreduce}。当前主流分布式训练框架如
 Megatron-LM\cite{narayanan2021efficient}、DeepSpeed\cite{rasley2020deepspeed}及
 PyTorch-FSDP（Fully Sharded Data Parallelism）\cite{zhao2023fsdp}已广泛应用于LLMs训练。
@@ -31,10 +31,9 @@ LLM的模型规模和训练数据正不断扩大，虽然带来了可观的性�
 度数据具有高冗余性——梯度向量中约有80\%$\sim$90\%的元素绝对值接近零，对模型更新贡献极小，传输完整梯度
 存在严重的带宽浪费。
 
-本研究旨在针对PyTorch-FSDP分布式训练框架，系统研究通信数据压缩技术的实现方法、优化策略和性能影响，并
+本研究旨在针对PyTorch-FSDP分布式训练框架，研究通信数据压缩技术的实现方法和性能影响，并
 针对LLMs训练中通信开销大、精度与压缩程度平衡难等问题，提出适配PyTorch-FSDP分片机制的通信数据压缩方案
-。通过将通信压缩技术与PyTorch-FSDP相结合，可以降低通信开销，提高训练效率，直接降低超大规模模型的训练
-能耗和碳足迹。
+。通过将通信压缩技术与PyTorch-FSDP相结合，可以降低通信开销，提高训练效率。
 
 \section{基于分布式训练框架的通信压缩相关理论的发展概况}
 
@@ -59,7 +58,7 @@ All-Reduce\cite{gibiansky2017allreduce}以及去中心化\cite{luo2020prague}等
 
 \subsection{分布式训练框架与并行策略研究现状}
 
-近年来，分布式训练与并行化已经成为大模型时代“基础设施”。
+近年来，分布式训练与并行化已经成为大模型训练的基本手段。
 
 在目前工业界主流训练框架中，Deepak Narayanan 等人提出了综合利用张量并
 行、流水线并行以及数据并行等多种并行策略组合而成的高效的大型 Transformer
@@ -117,10 +116,10 @@ layer2 的未切分参数。当自动求导引擎完成这两层的反向计算�
 在通信次数的优化领域，一个自然的并行化方向是增大 Batch Size 的大小，从
 而减少模型达到收敛时所需要的训练次数，更少的训练轮次意味着训练时各 GPU
 节点梯度同步频率的降低，从而提高通信效率\cite{liu2022largebatch}，但是在 N.S. Keskar 和 E. Hoffer
-的研究表明，增大 Batch Size 的训练更容易使，模型陷入“尖锐局部极小值”，使
+的研究表明，增大 Batch Size 的训练更容易使模型陷入"尖锐局部极小值"，使
 得深度神经网络模型的性能难以达到理想水平，此外增大 Batch Size 也会降低模型
 的泛化能力\cite{keskar2017large}；另一种做法便是 A. Resiziadeh 等人提出的一种以周期性聚合
-与量化为核心、并支持部分参与的通信高效联邦学习算法，核心在于各节点在于
+与量化为核心、并支持部分参与的通信高效联邦学习算法，核心在于各节点在
 服务器同步前进行若干轮本地更新，再周期性地把模型上传，以此显著减少通信
 轮次与总通信量，但是过多的本地更新会导致模型趋向于收敛到局部最优解\cite{reisizadeh2020fedpaq}。
 
@@ -147,11 +146,11 @@ layer2 的未切分参数。当自动求导引擎完成这两层的反向计算�
 \label{fig:comm-compression-threefigs}
 \end{figure}
 
-如图~\ref{fig:comm-compression-threefigs}所示，稀疏化的核心思想是仅传输对深度神经网络模型训练收敛具有显著影响的大
-梯度元素，目前主流的稀疏化方法包括仅发送随机梯度中最重要的分量（top-k 稀
-疏化）\cite{stich2018sparsified}、通过正负双阈值过滤小梯度的 threshold-v\cite{dutta2020threshold}以及对整个梯度张
-量进行 Sketch 映射（Sketched-SGD）\cite{ivkin2019communication}或矩阵分解（GradiVeQ）\cite{yu2018gradiveq}并以
-此为根据保留重要元素。
+如图~\ref{fig:comm-compression-threefigs}所示，稀疏化的核心思想是仅传输对深度神经网络模型训练收敛具有显著影响的
+梯度元素。目前主流的稀疏化方法包括仅发送绝对值最大的部分梯度元素（Top-k稀
+疏化）\cite{stich2018sparsified}、通过正负双阈值过滤小梯度元素的Threshold-v\cite{dutta2020threshold}，以及对整个梯度张
+量进行Sketch映射（Sketched-SGD）\cite{ivkin2019communication}或矩阵分解（GradiVeQ）\cite{yu2018gradiveq}，并据
+此保留重要梯度元素。
 
 在量化方面，从图~\ref{fig:comm-compression-threefigs}中可以归纳为两大机制：截断表达和码本映射。前者的主要区别
 在于单个梯度元素所使用的比特数，例如 FP16\cite{micikevicius2017mixed}和 8- BITAPPROXIMATIONS
@@ -171,7 +170,7 @@ layer2 的未切分参数。当自动求导引擎完成这两层的反向计算�
 \section{本文的主要研究内容}
 
 本文的研究内容围绕PyTorch-FSDP框架下的通信优化展开，针对分布式训练中梯度同步通信开销大、
-单一压缩方法存在压缩比或收敛质量瓶颈、固定压缩率难以适应训练全程等问题，开展以下五个方面的研究：
+单一压缩方法存在压缩比或收敛质量瓶颈、固定压缩率难以适应训练全程等问题，主要开展了以下工作：
 
 \subsection{FSDP训练过程的通信瓶颈分析}
 
@@ -183,7 +182,7 @@ layer2 的未切分参数。当自动求导引擎完成这两层的反向计算�
 
 基于FSDP的hook机制，设计与训练主循环解耦的可配置通信压缩框架，
 支持多种压缩算法的无缝切换与组合使用。在该框架下，
-实现量化类（int8、QSGD、Natural Compression、1-bit Seide）和
+实现量化类（int8量化、QSGD、Natural Compression、1-bit Seide）和
 稀疏化类（Top-k、Random-k、Threshold-v、Sketched-SGD）共9种压缩算法，
 并配合误差反馈机制保证有偏压缩的收敛性。
 
@@ -195,7 +194,7 @@ layer2 的未切分参数。当自动求导引擎完成这两层的反向计算�
 \subsection{两阶段混合压缩方法}
 
 针对单一压缩方法压缩比存在上限的问题，设计并实现两阶段混合压缩方法：
-第一阶段通过稀疏化（Top-k、Threshold-v或Random-k）筛选重要梯度分量，第二阶段对选中分量进行低比特量化（int8或1-bit）
+第一阶段通过稀疏化（Top-k、Threshold-v或Random-k）筛选重要梯度元素，第二阶段对选中梯度元素进行低比特量化（int8或1-bit）
 ，从而获得乘性压缩比。以Top-k（稀疏率1\%）与int8级联为例，有效压缩比可达约44倍，远超任一单独方法。
 
 \subsection{自适应压缩调度策略}
@@ -210,6 +209,5 @@ Grad-Adaptive策略通过跟踪梯度L2范数的指数移动平均并经Sigmoid�
 通过PyTorch Profiler对单卡与多卡训练进行细粒度性能对比，定量揭示通信开销的来源与严重程度；
 第3章详细阐述基于FSDP通信钩子机制的模块化压缩框架设计，以及9种量化与稀疏化压缩算法的实现细节；
 第4章在统一实验配置下对各基线压缩算法进行系统性对比评估，分析各算法在收敛质量、训练效率与压缩比之间的权衡关系；
-第5章提出两阶段混合压缩方法与自适应压缩调度策略，从"压得更狠"和"压得更聪明"两个方向对通信压缩方法进行扩展研究；
+第5章提出两阶段混合压缩方法与自适应压缩调度策略，对通信压缩方法进行进一步扩展；
 最后为结论，总结全文工作并展望未来研究方向。
-
