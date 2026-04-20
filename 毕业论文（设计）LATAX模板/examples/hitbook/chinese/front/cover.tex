@@ -22,7 +22,7 @@
   exueke={Engineering},
   esubject={Computer Science and Technology},
   eaffil={School of Computer Science and Technology, Shenzhen Campus},
-  eauthor={Kuai Ge},
+  eauthor={Wang Yunlong},
   esupervisor={Shi Shaohuai},
   edate={May, 2026},
   %
@@ -34,7 +34,7 @@
 
 随着深度学习模型规模不断增长，分布式训练已成为大模型训练的重要手段。PyTorch全分片数据并行（Fully Sharded Data Parallel, FSDP）通过对模型参数、梯度和优化器状态进行分片，能够有效缓解单设备显存压力，但随之而来的梯度同步通信也成为影响训练效率的重要因素。围绕这一问题，本文研究了PyTorch FSDP框架下通信数据压缩方法的设计与效果。
 
-首先，利用PyTorch Profiler对FSDP训练过程进行了细粒度分析，并通过单卡与两机两卡对比实验定位通信瓶颈。结果表明，在GPT-2 Large模型训练中，通信开销占单步耗时的61.2\%，其中Reduce-Scatter位于反向传播关键路径上，是更值得优先优化的通信环节。随后，设计了基于FSDP通信钩子机制的模块化通信压缩框架，实现了int8、QSGD、Natural Compression、1-bit Seide、Top-k、Random-k、Threshold-v和Sketched-SGD等9种压缩算法的统一接入与切换。
+首先，利用PyTorch Profiler对FSDP训练过程进行了细粒度分析，并通过单卡与两机两卡对比实验定位通信瓶颈。结果表明，在GPT-2 Large模型训练中，通信开销占单步耗时的61.2\%，其中Reduce-Scatter位于反向传播关键路径上，是更值得优先优化的通信环节。随后，设计了基于FSDP通信钩子机制的模块化通信压缩框架，实现了int8、QSGD、Natural Compression、1-bit Seide、Top-k、Random-k、Threshold-v和Sketched-SGD等8种压缩算法的统一接入与切换。
 
 在此基础上，进一步设计了两阶段混合压缩方法和自适应压缩调度策略。前者将稀疏化与量化级联，后者根据训练阶段动态调整压缩强度。实验结果表明，int8量化、Top-k和Threshold-v在压缩比、通信时间和收敛质量之间表现较为均衡；以Top-k（\(\rho=0.01\)）与int8级联为例，有效压缩比约为44倍；自适应调度策略则能够在保持收敛质量基本稳定的同时改善训练效率。本文的工作可为FSDP场景下的通信优化提供一定的实现参考。
 
@@ -44,7 +44,7 @@
 
 With the growth of deep learning model scales, distributed training has become essential for large-model training. PyTorch Fully Sharded Data Parallel (FSDP) reduces memory pressure by sharding parameters, gradients, and optimizer states across devices, but the resulting gradient synchronization communication also becomes an important factor affecting training efficiency. This thesis studies communication compression methods for PyTorch FSDP training.
 
-First, PyTorch Profiler is used to analyze the FSDP training process through comparisons between single-GPU and two-node two-GPU settings. The results show that, for GPT-2 Large training, communication accounts for 61.2\% of the per-step time, and Reduce-Scatter lies on the critical path of backward propagation. Then, a modular communication compression framework based on the FSDP communication hook mechanism is designed, supporting unified integration of 9 compression algorithms, including int8, QSGD, Natural Compression, 1-bit Seide, Top-k, Random-k, Threshold-v, and Sketched-SGD.
+First, PyTorch Profiler is used to analyze the FSDP training process through comparisons between single-GPU and two-node two-GPU settings. The results show that, for GPT-2 Large training, communication accounts for 61.2\% of the per-step time, and Reduce-Scatter lies on the critical path of backward propagation. Then, a modular communication compression framework based on the FSDP communication hook mechanism is designed, supporting unified integration of 8 compression algorithms, including int8, QSGD, Natural Compression, 1-bit Seide, Top-k, Random-k, Threshold-v, and Sketched-SGD.
 
 Furthermore, a two-stage hybrid compression method and adaptive compression scheduling strategies are proposed. Experiments show that int8, Top-k, and Threshold-v provide relatively balanced trade-offs among compression ratio, communication time, and convergence quality. For example, cascading Top-k (\(\rho=0.01\)) with int8 achieves an effective compression ratio of about 44\(\times\). Adaptive scheduling further improves training efficiency while maintaining acceptable convergence quality. These results provide practical references for communication optimization in FSDP training.
 
