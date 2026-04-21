@@ -1410,7 +1410,7 @@
     %   \xiaosi\hit@secretlevel：公开\hspace{14mm}
     % \end{flushright}
     \begin{flushleft}
-      \makebox[\textwidth]{\xiaosi$\square$~毕业论文\quad$\square$~毕业设计\hfill\hit@secretlevel：公开\hspace{0mm}}
+      \makebox[\textwidth]{\xiaosi $\square$\llap{\raisebox{0.15ex}{\hspace{0.2em}\scriptsize$\checkmark$}}~毕业论文\quad$\square$~毕业设计\hfill\hit@secretlevel：公开\hspace{0mm}}
     \end{flushleft}
     \vspace{2.1cm}
     {\songti\bfseries\xiaoer \hit@bachelor@cxuewei    \hit@bachelor@cthesisname}\\[0.8cm]
